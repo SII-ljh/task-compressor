@@ -172,6 +172,25 @@ class TaskCompressorModel(nn.Module):
             if hasattr(module, "_disable_adapters"):
                 module._disable_adapters = False
 
+    @property
+    def _gradient_checkpointing_enabled(self) -> bool:
+        """Check if gradient checkpointing is currently enabled."""
+        return getattr(self.base_model, "is_gradient_checkpointing", False)
+
+    def _pause_gradient_checkpointing(self):
+        """Temporarily disable gradient checkpointing, return whether it was on."""
+        was_enabled = self._gradient_checkpointing_enabled
+        if was_enabled:
+            self.base_model.gradient_checkpointing_disable()
+        return was_enabled
+
+    def _resume_gradient_checkpointing(self, was_enabled: bool):
+        """Re-enable gradient checkpointing if it was on before."""
+        if was_enabled:
+            self.base_model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
+
     def decode_train(
         self,
         compressed: torch.Tensor,
@@ -183,7 +202,14 @@ class TaskCompressorModel(nn.Module):
         """Student decode with teacher-forcing. Returns logits and labels.
 
         Input sequence: [compressed (k) | sep (1) | prompt (L_p) | response (L_t)]
+
+        Gradient checkpointing is temporarily disabled during decode because
+        the LoRA adapter toggle changes the computation graph.  Checkpointing
+        recomputation would see the wrong adapter state, producing shape
+        mismatches.  The decode sequence is typically much shorter than the
+        encode context, so the memory cost is acceptable.
         """
+        gc_was_on = self._pause_gradient_checkpointing()
         self._disable_adapter_forward_only()
         B = compressed.shape[0]
         device = compressed.device
@@ -229,6 +255,7 @@ class TaskCompressorModel(nn.Module):
 
         # Re-enable adapter forward so subsequent calls (e.g. encode) work
         self._enable_adapter_forward_only()
+        self._resume_gradient_checkpointing(gc_was_on)
 
         return {
             "logits": logits,
@@ -249,6 +276,7 @@ class TaskCompressorModel(nn.Module):
         Returns:
             (B, L_total, V) teacher logits.
         """
+        gc_was_on = self._pause_gradient_checkpointing()
         self._disable_adapter_forward_only()
         with torch.no_grad():
             outputs = self.base_model(
@@ -257,6 +285,7 @@ class TaskCompressorModel(nn.Module):
                 return_dict=True,
             )
         self._enable_adapter_forward_only()
+        self._resume_gradient_checkpointing(gc_was_on)
         return outputs.logits
 
     def forward(
@@ -374,6 +403,7 @@ class TaskCompressorModel(nn.Module):
         Returns:
             (B, max_generated) generated token ids
         """
+        gc_was_on = self._pause_gradient_checkpointing()
         self._disable_adapter_forward_only()
         B = compressed.shape[0]
         device = compressed.device
@@ -437,4 +467,5 @@ class TaskCompressorModel(nn.Module):
             )
 
         self._enable_adapter_forward_only()
+        self._resume_gradient_checkpointing(gc_was_on)
         return torch.cat(generated_ids, dim=-1)  # (B, num_generated)

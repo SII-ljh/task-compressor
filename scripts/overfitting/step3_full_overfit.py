@@ -404,11 +404,6 @@ def main():
         model.load_state_dict(weights, strict=False)
         logger.info(f"Loaded checkpoint: {args.checkpoint}")
 
-    if config.model.gradient_checkpointing:
-        model.base_model.gradient_checkpointing_enable(
-            gradient_checkpointing_kwargs={"use_reentrant": False})
-        logger.info("Gradient checkpointing enabled")
-
     model = model.to(device)
 
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
