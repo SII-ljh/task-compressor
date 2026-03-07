@@ -71,9 +71,7 @@ def load_model_from_checkpoint(
             f"{len(missing)} missing, {len(unexpected)} unexpected"
         )
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        config.model.base_model, trust_remote_code=True
-    )
+    tokenizer = AutoTokenizer.from_pretrained(config.model.base_model)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
 

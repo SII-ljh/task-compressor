@@ -36,7 +36,6 @@ class TaskCompressorModel(nn.Module):
         self.base_model = AutoModelForCausalLM.from_pretrained(
             config.base_model,
             torch_dtype=torch_dtype,
-            trust_remote_code=True,
         )
         # Freeze all base model parameters first
         for p in self.base_model.parameters():

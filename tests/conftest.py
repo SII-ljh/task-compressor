@@ -32,7 +32,7 @@ def dtype():
 def small_config():
     """Config matching a tiny Qwen-like model."""
     return AutoConfig.from_pretrained(
-        "Qwen/Qwen2.5-0.5B-Instruct",
+        "Qwen/Qwen3-0.6B",
         hidden_size=HIDDEN_SIZE,
         num_attention_heads=NUM_HEADS,
         num_key_value_heads=NUM_HEADS,
@@ -41,7 +41,6 @@ def small_config():
         vocab_size=VOCAB_SIZE,
         max_position_embeddings=MAX_SEQ_LEN * 4,
         torch_dtype=torch.float32,
-        trust_remote_code=True,
     )
 
 

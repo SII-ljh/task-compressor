@@ -98,9 +98,7 @@ def main():
 
     # ── Tokenizer ────────────────────────────────────────────────────────
     logger.info(f"Loading tokenizer from {config.model.base_model}")
-    tokenizer = AutoTokenizer.from_pretrained(
-        config.model.base_model, trust_remote_code=True
-    )
+    tokenizer = AutoTokenizer.from_pretrained(config.model.base_model)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
 

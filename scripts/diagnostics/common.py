@@ -152,16 +152,16 @@ def prepare_qa_batch(
         (batch_on_device, tokenizer)
     """
     model_name = tokenizer_name or config.model.base_model
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
     ds = QADataset(
         data_path,
         tokenizer,
-        max_context_len=config.data.max_context_length,
-        max_prompt_len=config.data.max_prompt_length,
-        max_response_len=config.data.max_response_length,
+        max_context_length=config.data.max_context_length,
+        max_prompt_length=config.data.max_prompt_length,
+        max_response_length=config.data.max_response_length,
     )
     collator = QACollator(pad_token_id=tokenizer.pad_token_id)
 
@@ -188,16 +188,16 @@ def prepare_qa_loader(
         (data_loader, tokenizer)
     """
     model_name = tokenizer_name or config.model.base_model
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
     ds = QADataset(
         data_path,
         tokenizer,
-        max_context_len=config.data.max_context_length,
-        max_prompt_len=config.data.max_prompt_length,
-        max_response_len=config.data.max_response_length,
+        max_context_length=config.data.max_context_length,
+        max_prompt_length=config.data.max_prompt_length,
+        max_response_length=config.data.max_response_length,
     )
     if max_samples > 0 and max_samples < len(ds):
         ds = Subset(ds, list(range(max_samples)))

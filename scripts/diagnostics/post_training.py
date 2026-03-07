@@ -174,17 +174,16 @@ def run_length_scaling(
 
     if tokenizer is None:
         from transformers import AutoTokenizer
-        tokenizer = AutoTokenizer.from_pretrained(
-            config.model.base_model, trust_remote_code=True)
+        tokenizer = AutoTokenizer.from_pretrained(config.model.base_model)
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
 
     ds = QADataset(
         data_path,
         tokenizer,
-        max_context_len=max(length_buckets) + 256,
-        max_prompt_len=config.data.max_prompt_length,
-        max_response_len=config.data.max_response_length,
+        max_context_length=max(length_buckets) + 256,
+        max_prompt_length=config.data.max_prompt_length,
+        max_response_length=config.data.max_response_length,
     )
     collator = QACollator(pad_token_id=tokenizer.pad_token_id)
 

@@ -363,7 +363,7 @@ def main():
 
     # Tokenizer
     tokenizer = __import__("transformers").AutoTokenizer.from_pretrained(
-        config.model.base_model, trust_remote_code=True)
+        config.model.base_model)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 

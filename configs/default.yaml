@@ -3,7 +3,7 @@
 # ============================================================
 
 model:
-  base_model: "Qwen/Qwen2.5-7B-Instruct"
+  base_model: "Qwen/Qwen3-0.6B"
   lora_rank: 128
   lora_alpha: 128
   lora_target_modules: ["q_proj", "v_proj"]

@@ -36,7 +36,7 @@ def _build_tiny_model() -> TaskCompressorModel:
 
     # Create tiny Qwen model directly from config
     model_config = AutoConfig.from_pretrained(
-        "Qwen/Qwen2.5-0.5B-Instruct",
+        "Qwen/Qwen3-0.6B",
         hidden_size=HIDDEN_SIZE,
         num_attention_heads=NUM_HEADS,
         num_key_value_heads=NUM_HEADS,
@@ -45,7 +45,6 @@ def _build_tiny_model() -> TaskCompressorModel:
         vocab_size=VOCAB_SIZE,
         max_position_embeddings=512,
         torch_dtype=torch.float32,
-        trust_remote_code=True,
     )
     base_model = AutoModelForCausalLM.from_config(model_config).float()
 

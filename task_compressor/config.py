@@ -10,7 +10,7 @@ import yaml
 
 @dataclass
 class ModelConfig:
-    base_model: str = "Qwen/Qwen2.5-7B-Instruct"
+    base_model: str = "Qwen/Qwen3-0.6B"
     lora_rank: int = 128
     lora_alpha: int = 128
     lora_target_modules: List[str] = field(
