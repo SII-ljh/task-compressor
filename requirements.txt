@@ -1,17 +1,31 @@
 # ============================================================
-# Task Compressor  —  Dependencies (download & data processing)
+# Task Compressor  —  Dependencies
 # ============================================================
 
 # ── Core Deep Learning ──────────────────────────────────────
 torch>=2.0.0
 transformers>=4.40.0
 sentencepiece>=0.1.99
+peft>=0.10.0
+accelerate>=0.30.0
 
 # ── Data ────────────────────────────────────────────────────
 datasets>=2.20.0
 pandas>=2.0.0
 numpy>=1.24.0
 
+# ── Training & Logging ─────────────────────────────────────
+wandb>=0.16.0
+deepspeed>=0.14.0
+safetensors>=0.4.0
+
+# ── Evaluation ──────────────────────────────────────────────
+rouge-score>=0.1.2
+nltk>=3.8.0
+
 # ── Utilities ──────────────────────────────────────────────
 tqdm>=4.65.0
 PyYAML>=6.0.0
+
+# ── Testing ─────────────────────────────────────────────────
+pytest>=8.0.0

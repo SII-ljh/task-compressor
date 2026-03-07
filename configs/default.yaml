@@ -1,0 +1,48 @@
+# ============================================================
+# Task Compressor  —  Default Configuration
+# ============================================================
+
+model:
+  base_model: "Qwen/Qwen2.5-7B-Instruct"
+  lora_rank: 128
+  lora_alpha: 128
+  lora_target_modules: ["q_proj", "v_proj"]
+  lora_dropout: 0.0
+  n_prompt_tokens: 16      # n_p: prompt-conditioned latent tokens
+  n_context_tokens: 48     # n_c: learnable context tokens
+  # total soft prompt k = n_p + n_c = 64
+  num_perceiver_layers: 2
+  perceiver_ffn_mult: 4    # FFN intermediate = hidden_size * mult (0 = use model's intermediate_size)
+  gradient_checkpointing: true
+
+training:
+  per_gpu_batch_size: 2
+  gradient_accumulation_steps: 8
+  # effective batch_size = per_gpu * num_gpus * grad_accum
+  warmup_steps: 500
+  total_steps: 50000
+  lora_lr: 1.0e-5
+  perceiver_lr: 5.0e-5
+  max_grad_norm: 2.0
+  weight_decay: 0.01
+  distill_alpha: 0.5
+  distill_temperature: 2.0
+  distill_method: "kl"       # "kl" or "mse"
+  bf16: true
+  deepspeed: null             # path to deepspeed config, null = DDP
+  save_steps: 1000
+  eval_steps: 500
+  logging_steps: 10
+
+data:
+  max_context_length: 4096
+  max_prompt_length: 256
+  max_response_length: 512
+  train_file: "data/qa_train.json"
+  dev_file: "data/qa_dev.json"
+  num_workers: 4
+
+output_dir: "outputs"
+wandb_project: "task-compressor"
+wandb_run_name: null
+seed: 42
