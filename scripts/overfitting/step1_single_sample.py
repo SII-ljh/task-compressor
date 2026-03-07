@@ -277,9 +277,9 @@ def main():
     # Dataset: use only the first sample
     full_ds = QADataset(
         args.data_path, tokenizer,
-        max_context_len=config.data.max_context_length,
-        max_prompt_len=config.data.max_prompt_length,
-        max_response_len=config.data.max_response_length,
+        max_context_length=config.data.max_context_length,
+        max_prompt_length=config.data.max_prompt_length,
+        max_response_length=config.data.max_response_length,
     )
     train_ds = Subset(full_ds, [0])  # single sample
     logger.info(f"Dataset: {len(full_ds)} total, using 1 sample for overfitting")

@@ -370,9 +370,9 @@ def main():
     # Dataset & split
     full_ds = QADataset(
         args.data_path, tokenizer,
-        max_context_len=config.data.max_context_length,
-        max_prompt_len=config.data.max_prompt_length,
-        max_response_len=config.data.max_response_length,
+        max_context_length=config.data.max_context_length,
+        max_prompt_length=config.data.max_prompt_length,
+        max_response_length=config.data.max_response_length,
     )
     n_total = len(full_ds)
     n_val = max(1, int(n_total * args.val_ratio))

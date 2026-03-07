@@ -290,9 +290,9 @@ def main():
     # Dataset: first N samples
     full_ds = QADataset(
         args.data_path, tokenizer,
-        max_context_len=config.data.max_context_length,
-        max_prompt_len=config.data.max_prompt_length,
-        max_response_len=config.data.max_response_length,
+        max_context_length=config.data.max_context_length,
+        max_prompt_length=config.data.max_prompt_length,
+        max_response_length=config.data.max_response_length,
     )
     n_use = min(args.num_samples, len(full_ds))
     train_ds = Subset(full_ds, list(range(n_use)))
