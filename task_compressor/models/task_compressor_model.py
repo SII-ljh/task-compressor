@@ -187,6 +187,10 @@ class TaskCompressorModel(nn.Module):
     def _resume_gradient_checkpointing(self, was_enabled: bool):
         """Re-enable gradient checkpointing if it was on before."""
         if was_enabled:
+            # gradient_checkpointing_disable() sets config.use_cache=True;
+            # reset before re-enabling to suppress spurious warning
+            if hasattr(self.base_model, "config"):
+                self.base_model.config.use_cache = False
             self.base_model.gradient_checkpointing_enable(
                 gradient_checkpointing_kwargs={"use_reentrant": False}
             )
