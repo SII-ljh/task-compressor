@@ -1,13 +1,20 @@
 #!/usr/bin/env python3
 """Step 1: Single-sample overfit test — local validation (~5 min).
 
-Train the full Task Compressor pipeline on a single QA sample.
+Train the full Task Compressor pipeline on a single sample.
+Supports both Stage 1 (NTP) and Stage 2 (QA) modes.
+
 Goal: loss drops hard, demonstrating the pipeline can learn.
 
 Usage:
-  python scripts/overfitting/step1_single_sample.py
-  python scripts/overfitting/step1_single_sample.py --steps 500 --lr 1e-3
-  python scripts/overfitting/step1_single_sample.py --data_path data/qa_dev.json
+  # Stage 1 (NTP) — default
+  python scripts/overfitting/step1_single_sample.py --stage 1
+
+  # Stage 2 (QA)
+  python scripts/overfitting/step1_single_sample.py --stage 2
+
+  # Custom settings
+  python scripts/overfitting/step1_single_sample.py --stage 1 --steps 500 --lr 1e-3
 """
 
 import argparse
@@ -28,7 +35,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from task_compressor.config import Config
-from task_compressor.data import QADataset, QACollator
+from task_compressor.data import NTPCollator, NTPDataset, QACollator, QADataset
 from task_compressor.models import TaskCompressorModel
 
 logging.basicConfig(
@@ -42,8 +49,8 @@ logger = logging.getLogger("step1_single_sample")
 # ── Evaluation ────────────────────────────────────────────────────────
 
 @torch.no_grad()
-def evaluate_qa(model, loader, device, use_bf16=False):
-    """Compute average QA loss."""
+def evaluate(model, loader, device, stage, use_bf16=False):
+    """Compute average loss for the given stage."""
     model.eval()
     total_loss = 0.0
     total_samples = 0
@@ -52,17 +59,30 @@ def evaluate_qa(model, loader, device, use_bf16=False):
         batch_dev = {k: v.to(device) if isinstance(v, torch.Tensor) else v
                      for k, v in batch.items()}
         with autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
-            outputs = model(
-                context_ids=batch_dev["context_ids"],
-                context_mask=batch_dev["context_mask"],
-                prompt_ids=batch_dev["prompt_ids"],
-                prompt_mask=batch_dev["prompt_mask"],
-                response_ids=batch_dev["response_ids"],
-                response_mask=batch_dev["response_mask"],
-                distill_alpha=0.0,
-            )
-        bs = batch_dev["context_ids"].shape[0]
-        total_loss += outputs["qa_loss"].float().item() * bs
+            if stage == 1:
+                outputs = model(
+                    mode="ntp",
+                    doc_ids=batch_dev["doc_ids"],
+                    doc_mask=batch_dev["doc_mask"],
+                    segment_ids=batch_dev["segment_ids"],
+                    segment_mask=batch_dev["segment_mask"],
+                    segment_labels=batch_dev["segment_labels"],
+                )
+                loss_key = "ntp_loss"
+            else:
+                outputs = model(
+                    mode="qa",
+                    context_ids=batch_dev["context_ids"],
+                    context_mask=batch_dev["context_mask"],
+                    prompt_ids=batch_dev["prompt_ids"],
+                    prompt_mask=batch_dev["prompt_mask"],
+                    response_ids=batch_dev["response_ids"],
+                    response_mask=batch_dev["response_mask"],
+                    distill_alpha=0.0,
+                )
+                loss_key = "qa_loss"
+        bs = next(v for v in batch_dev.values() if isinstance(v, torch.Tensor)).shape[0]
+        total_loss += outputs[loss_key].float().item() * bs
         total_samples += bs
 
     avg_loss = total_loss / max(total_samples, 1)
@@ -74,7 +94,7 @@ def evaluate_qa(model, loader, device, use_bf16=False):
 # ── Training loop ─────────────────────────────────────────────────────
 
 def train(model, train_loader, device, args, use_bf16=False):
-    """Single-sample QA training loop — no val split."""
+    """Single-sample training loop — no val split."""
 
     optimizer = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad],
@@ -110,7 +130,7 @@ def train(model, train_loader, device, args, use_bf16=False):
         logger.info("Using bf16 mixed precision (autocast)")
 
     # Initial eval
-    metrics = evaluate_qa(model, train_loader, device, use_bf16=use_bf16)
+    metrics = evaluate(model, train_loader, device, args.stage, use_bf16=use_bf16)
     logger.info(f"[init] train_loss={metrics['loss']:.4f}  train_ppl={metrics['perplexity']:.1f}")
     csv_writer.writerow([0, f"{metrics['loss']:.4f}", f"{metrics['perplexity']:.1f}",
                          f"{args.lr:.2e}", "0"])
@@ -125,19 +145,32 @@ def train(model, train_loader, device, args, use_bf16=False):
                          for k, v in batch.items()}
 
             with autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
-                outputs = model(
-                    context_ids=batch_dev["context_ids"],
-                    context_mask=batch_dev["context_mask"],
-                    prompt_ids=batch_dev["prompt_ids"],
-                    prompt_mask=batch_dev["prompt_mask"],
-                    response_ids=batch_dev["response_ids"],
-                    response_mask=batch_dev["response_mask"],
-                    distill_alpha=0.0,
-                )
+                if args.stage == 1:
+                    outputs = model(
+                        mode="ntp",
+                        doc_ids=batch_dev["doc_ids"],
+                        doc_mask=batch_dev["doc_mask"],
+                        segment_ids=batch_dev["segment_ids"],
+                        segment_mask=batch_dev["segment_mask"],
+                        segment_labels=batch_dev["segment_labels"],
+                    )
+                    loss_key = "ntp_loss"
+                else:
+                    outputs = model(
+                        mode="qa",
+                        context_ids=batch_dev["context_ids"],
+                        context_mask=batch_dev["context_mask"],
+                        prompt_ids=batch_dev["prompt_ids"],
+                        prompt_mask=batch_dev["prompt_mask"],
+                        response_ids=batch_dev["response_ids"],
+                        response_mask=batch_dev["response_mask"],
+                        distill_alpha=0.0,
+                    )
+                    loss_key = "qa_loss"
 
             loss = outputs["loss"]
             loss.backward()
-            running_loss += outputs["qa_loss"].float().item()
+            running_loss += outputs[loss_key].float().item()
             running_count += 1
 
             torch.nn.utils.clip_grad_norm_(
@@ -172,7 +205,7 @@ def train(model, train_loader, device, args, use_bf16=False):
                 break
 
     # Final eval
-    metrics = evaluate_qa(model, train_loader, device, use_bf16=use_bf16)
+    metrics = evaluate(model, train_loader, device, args.stage, use_bf16=use_bf16)
     elapsed = time.time() - t0
     logger.info(
         f"[FINAL] train_loss={metrics['loss']:.4f}  "
@@ -209,8 +242,10 @@ def main():
 
     parser.add_argument("--config", type=str, default="configs/default.yaml",
                         help="Path to YAML config file")
+    parser.add_argument("--stage", type=int, default=1, choices=[1, 2],
+                        help="Training stage: 1=NTP, 2=QA (default: 1)")
     parser.add_argument("--data_path", type=str, default=None,
-                        help="QA data path (default: auto-detect)")
+                        help="Data path (default: auto-detect based on stage)")
 
     parser.add_argument("--steps", type=int, default=300,
                         help="Total training steps (default: 300)")
@@ -231,19 +266,30 @@ def main():
 
     args = parser.parse_args()
 
-    # Auto-detect data path
+    # Auto-detect data path based on stage
     if args.data_path is None:
-        candidates = [
-            "data/qa_tiny.json",
-            "data/qa_dev.json",
-            "data/qa_train.json",
-        ]
+        if args.stage == 1:
+            candidates = [
+                "../deep_compressor/data/ntp_tiny.jsonl",
+                "../deep_compressor/data/ntp_train.jsonl",
+                "data/ntp_tiny.jsonl",
+                "data/ntp_train.jsonl",
+            ]
+        else:
+            candidates = [
+                "../deep_compressor/data/qa_tiny_train.json",
+                "../deep_compressor/data/qa_dev.json",
+                "../deep_compressor/data/qa_train.json",
+                "data/qa_tiny_train.json",
+                "data/qa_dev.json",
+                "data/qa_train.json",
+            ]
         for p in candidates:
             if os.path.exists(p):
                 args.data_path = p
                 break
         if args.data_path is None:
-            logger.error("No QA data found. Provide --data_path.")
+            logger.error("No data found. Provide --data_path.")
             sys.exit(1)
 
     # Device
@@ -255,6 +301,8 @@ def main():
     use_bf16 = (device.type == "cuda" and not args.no_bf16
                 and torch.cuda.is_bf16_supported())
 
+    mode_str = "NTP (Stage 1)" if args.stage == 1 else "QA (Stage 2)"
+    logger.info(f"Mode: {mode_str}")
     logger.info(f"Device: {device}")
     if device.type == "cuda":
         gpu_name = torch.cuda.get_device_name(0)
@@ -275,16 +323,25 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
 
     # Dataset: use only the first sample
-    full_ds = QADataset(
-        args.data_path, tokenizer,
-        max_context_length=config.data.max_context_length,
-        max_prompt_length=config.data.max_prompt_length,
-        max_response_length=config.data.max_response_length,
-    )
+    if args.stage == 1:
+        full_ds = NTPDataset(
+            args.data_path, tokenizer,
+            max_context_length=config.data.max_context_length,
+            ntp_segment_len=config.data.ntp_segment_len,
+        )
+        collator = NTPCollator(pad_token_id=tokenizer.pad_token_id)
+    else:
+        full_ds = QADataset(
+            args.data_path, tokenizer,
+            max_context_length=config.data.max_context_length,
+            max_prompt_length=config.data.max_prompt_length,
+            max_response_length=config.data.max_response_length,
+        )
+        collator = QACollator(pad_token_id=tokenizer.pad_token_id)
+
     train_ds = Subset(full_ds, [0])  # single sample
     logger.info(f"Dataset: {len(full_ds)} total, using 1 sample for overfitting")
 
-    collator = QACollator(pad_token_id=tokenizer.pad_token_id)
     train_loader = DataLoader(
         train_ds, batch_size=1, shuffle=False,
         collate_fn=collator, num_workers=0, pin_memory=False,
@@ -305,7 +362,7 @@ def main():
 
     # Summary
     print("\n" + "=" * 60)
-    print("  STEP 1: SINGLE-SAMPLE OVERFIT TEST")
+    print(f"  STEP 1: SINGLE-SAMPLE OVERFIT TEST ({mode_str})")
     print("=" * 60)
     print(f"  Device:       {device} {'(bf16)' if use_bf16 else '(fp32)'}")
     print(f"  Trainable:    {trainable:,} params")

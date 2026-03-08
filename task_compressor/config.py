@@ -46,6 +46,8 @@ class TrainingConfig:
     save_steps: int = 1000
     eval_steps: int = 500
     logging_steps: int = 10
+    stage: int = 1                     # 1=NTP pretraining, 2=QA fine-tuning
+    resume_from: Optional[str] = None  # checkpoint path for stage 2
 
 
 @dataclass
@@ -56,6 +58,8 @@ class DataConfig:
     train_file: str = "data/qa_train.json"
     dev_file: str = "data/qa_dev.json"
     num_workers: int = 4
+    ntp_train_file: str = "data/ntp_train.jsonl"
+    ntp_segment_len: int = 256
 
 
 @dataclass
@@ -92,6 +96,18 @@ class Config:
                 setattr(config, k, raw[k])
         return config
 
+    @staticmethod
+    def _cast(current_value, new_value: str):
+        """Cast a CLI string to the type of the current field value."""
+        if current_value is None:
+            # Optional field currently None — treat "null"/"none" as None,
+            # otherwise keep as string.
+            if new_value.lower() in ("null", "none"):
+                return None
+            return new_value
+        field_type = type(current_value)
+        return field_type(new_value)
+
     def merge_overrides(self, overrides: dict) -> None:
         """Merge a flat dict of overrides (e.g. from CLI) into this config.
 
@@ -103,11 +119,9 @@ class Config:
                 group, attr = parts
                 sub = getattr(self, group, None)
                 if sub is not None and hasattr(sub, attr):
-                    field_type = type(getattr(sub, attr))
-                    setattr(sub, attr, field_type(value))
+                    setattr(sub, attr, self._cast(getattr(sub, attr), value))
             elif len(parts) == 1 and hasattr(self, parts[0]):
-                field_type = type(getattr(self, parts[0]))
-                setattr(self, parts[0], field_type(value))
+                setattr(self, parts[0], self._cast(getattr(self, parts[0]), value))
 
     def to_dict(self) -> dict:
         return dataclasses.asdict(self)

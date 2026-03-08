@@ -1,8 +1,11 @@
 """Trainer for Task Compressor.
 
-Single-stage joint training with differential learning rates:
+Two-stage training with differential learning rates:
   - Perceiver / PromptEncoder / separator: perceiver_lr (5e-5)
   - LoRA adapters: lora_lr (1e-5)
+
+Stage 1 (NTP):  compress doc → soft prompts → predict continuation (CE only)
+Stage 2 (QA):   compress doc → soft prompts → answer question (CE + distillation)
 
 Supports DDP and optional DeepSpeed ZeRO-2.
 """
@@ -33,8 +36,10 @@ class Trainer:
         config: Config,
         train_loader: DataLoader,
         dev_loader: DataLoader | None = None,
+        mode: str = "qa",
     ):
         self.config = config
+        self.mode = mode  # "qa" or "ntp"
         self.train_loader = train_loader
         self.dev_loader = dev_loader
         self.global_step = 0
@@ -170,32 +175,47 @@ class Trainer:
             dtype=torch.bfloat16,
             enabled=self.use_amp,
         ):
-            outputs = self.model(
-                context_ids=batch["context_ids"],
-                context_mask=batch["context_mask"],
-                prompt_ids=batch["prompt_ids"],
-                prompt_mask=batch["prompt_mask"],
-                response_ids=batch["response_ids"],
-                response_mask=batch["response_mask"],
-                teacher_input_ids=batch["teacher_input_ids"],
-                teacher_attention_mask=batch["teacher_attention_mask"],
-                response_starts=batch["response_starts"],
-                response_lens=batch["response_lens"],
-                distill_alpha=tc.distill_alpha,
-                distill_temperature=tc.distill_temperature,
-                distill_method=tc.distill_method,
-            )
+            if self.mode == "ntp":
+                outputs = self.model(
+                    mode="ntp",
+                    doc_ids=batch["doc_ids"],
+                    doc_mask=batch["doc_mask"],
+                    segment_ids=batch["segment_ids"],
+                    segment_mask=batch["segment_mask"],
+                    segment_labels=batch["segment_labels"],
+                )
+            else:
+                outputs = self.model(
+                    mode="qa",
+                    context_ids=batch["context_ids"],
+                    context_mask=batch["context_mask"],
+                    prompt_ids=batch["prompt_ids"],
+                    prompt_mask=batch["prompt_mask"],
+                    response_ids=batch["response_ids"],
+                    response_mask=batch["response_mask"],
+                    teacher_input_ids=batch["teacher_input_ids"],
+                    teacher_attention_mask=batch["teacher_attention_mask"],
+                    response_starts=batch["response_starts"],
+                    response_lens=batch["response_lens"],
+                    distill_alpha=tc.distill_alpha,
+                    distill_temperature=tc.distill_temperature,
+                    distill_method=tc.distill_method,
+                )
 
         loss = outputs["loss"] / tc.gradient_accumulation_steps
         loss.backward()
 
-        return {
+        metrics = {
             "loss": outputs["loss"].item(),
-            "qa_loss": outputs["qa_loss"].item(),
-            "distill_loss": outputs["distill_loss"].item(),
             "lr_perceiver": self.optimizer.param_groups[0]["lr"],
             "lr_lora": self.optimizer.param_groups[1]["lr"],
         }
+        if self.mode == "ntp":
+            metrics["ntp_loss"] = outputs["ntp_loss"].item()
+        else:
+            metrics["qa_loss"] = outputs["qa_loss"].item()
+            metrics["distill_loss"] = outputs["distill_loss"].item()
+        return metrics
 
     @torch.no_grad()
     def _evaluate(self):
@@ -203,30 +223,41 @@ class Trainer:
             return
         self.model.eval()
         total_loss = 0.0
-        total_qa = 0.0
         n = 0
 
         for batch in self.dev_loader:
             batch = {k: v.to(self.device) for k, v in batch.items()}
             with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=self.use_amp):
-                outputs = self.model(
-                    context_ids=batch["context_ids"],
-                    context_mask=batch["context_mask"],
-                    prompt_ids=batch["prompt_ids"],
-                    prompt_mask=batch["prompt_mask"],
-                    response_ids=batch["response_ids"],
-                    response_mask=batch["response_mask"],
-                    distill_alpha=0.0,
-                )
+                if self.mode == "ntp":
+                    outputs = self.model(
+                        mode="ntp",
+                        doc_ids=batch["doc_ids"],
+                        doc_mask=batch["doc_mask"],
+                        segment_ids=batch["segment_ids"],
+                        segment_mask=batch["segment_mask"],
+                        segment_labels=batch["segment_labels"],
+                    )
+                else:
+                    outputs = self.model(
+                        mode="qa",
+                        context_ids=batch["context_ids"],
+                        context_mask=batch["context_mask"],
+                        prompt_ids=batch["prompt_ids"],
+                        prompt_mask=batch["prompt_mask"],
+                        response_ids=batch["response_ids"],
+                        response_mask=batch["response_mask"],
+                        distill_alpha=0.0,
+                    )
             total_loss += outputs["loss"].item()
-            total_qa += outputs["qa_loss"].item()
             n += 1
 
-        metrics = {
-            "eval/loss": total_loss / max(n, 1),
-            "eval/qa_loss": total_qa / max(n, 1),
+        avg_loss = total_loss / max(n, 1)
+        metrics: dict = {
+            "eval/loss": avg_loss,
             "step": self.global_step,
         }
+        if self.mode == "ntp":
+            metrics["eval/perplexity"] = math.exp(min(avg_loss, 20))
         if self.is_main:
             logger.info(f"[Eval step={self.global_step}] {metrics}")
             if self._wandb:

@@ -2,16 +2,24 @@
 """Post-training diagnostic experiments for Task Compressor.
 
 Exp 6 — Compression Fidelity: Multi-batch cosine similarity between compressed and original.
-Exp 7 — Context Length Scaling: QA loss vs context token length.
-Exp 8 — Distillation Effectiveness: KL divergence, token prediction agreement.
+Exp 7 — Context Length Scaling: Loss vs context token length.
+Exp 8 — Distillation Effectiveness: KL divergence, token prediction agreement (Stage 2 only).
 
+Supports both Stage 1 (NTP) and Stage 2 (QA) modes.
 Requires a trained checkpoint and evaluation data.
 
 Usage:
-    python scripts/diagnostics/post_training.py \
+    # Stage 1 (NTP)
+    python scripts/diagnostics/post_training.py --stage 1 \
         --config configs/default.yaml \
         --checkpoint outputs/checkpoint.pt \
-        --data_path data/qa_dev.json \
+        --experiments 6,7
+
+    # Stage 2 (QA)
+    python scripts/diagnostics/post_training.py --stage 2 \
+        --config configs/default.yaml \
+        --checkpoint outputs/checkpoint.pt \
+        --data_path ../deep_compressor/data/qa_dev.json \
         --experiments 6,7,8
 """
 
@@ -27,6 +35,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 
 from scripts.diagnostics.common import (
+    auto_detect_data_path,
     base_parser,
     detect_device,
     detect_dtype,
@@ -34,11 +43,12 @@ from scripts.diagnostics.common import (
     init_wandb,
     load_model,
     log_wandb,
+    prepare_ntp_loader,
     prepare_qa_loader,
     to_device,
 )
 from task_compressor.config import Config
-from task_compressor.data import QADataset, QACollator
+from task_compressor.data import NTPCollator, NTPDataset, QACollator, QADataset
 
 
 ALL_EXPERIMENTS = ["6", "7", "8"]
@@ -52,6 +62,7 @@ def run_compression_fidelity(
     model,
     eval_loader: DataLoader,
     device: torch.device,
+    stage: int,
     max_batches: int = 10,
 ) -> dict:
     """Measure how well compressed soft prompts preserve context information.
@@ -60,8 +71,9 @@ def run_compression_fidelity(
     encoder hidden states against random baselines.
     """
 
+    mode_str = "NTP" if stage == 1 else "QA"
     print("\n" + "=" * 76)
-    print("  EXPERIMENT 6: Compression Fidelity")
+    print(f"  EXPERIMENT 6: Compression Fidelity ({mode_str})")
     print("=" * 76)
 
     model.eval()
@@ -79,20 +91,23 @@ def run_compression_fidelity(
         num_batches += 1
 
         with torch.no_grad():
-            # Encode context
-            encoder_hidden = model.encode(
-                batch["context_ids"], batch["context_mask"]
-            )
-
-            # Compress
-            compressed = model.compress(
-                encoder_hidden, batch["context_mask"],
-                batch["prompt_ids"], batch["prompt_mask"],
-            )
+            if stage == 1:
+                encoder_hidden = model.encode(batch["doc_ids"], batch["doc_mask"])
+                encoder_mask = batch["doc_mask"]
+                compressed = model.compress_ntp(encoder_hidden, encoder_mask)
+            else:
+                encoder_hidden = model.encode(
+                    batch["context_ids"], batch["context_mask"]
+                )
+                encoder_mask = batch["context_mask"]
+                compressed = model.compress(
+                    encoder_hidden, encoder_mask,
+                    batch["prompt_ids"], batch["prompt_mask"],
+                )
 
             # Mean pooled representations
             compressed_pooled = compressed.float().mean(dim=1)
-            mask_f = batch["context_mask"].unsqueeze(-1).float()
+            mask_f = encoder_mask.unsqueeze(-1).float()
             encoder_pooled = (
                 (encoder_hidden.float() * mask_f).sum(1) / mask_f.sum(1).clamp(min=1)
             )
@@ -154,17 +169,20 @@ def run_length_scaling(
     data_path: str,
     config: Config,
     device: torch.device,
+    stage: int,
     length_buckets: list[int] | None = None,
     samples_per_bucket: int = 20,
     tokenizer=None,
 ) -> dict:
-    """Measure QA loss as a function of context length.
+    """Measure loss as a function of context length.
 
-    Loads QA data, buckets by context token count, and runs forward pass per bucket.
+    For Stage 1: measures NTP loss vs document length.
+    For Stage 2: measures QA loss vs context token length.
     """
 
+    mode_str = "NTP" if stage == 1 else "QA"
     print("\n" + "=" * 76)
-    print("  EXPERIMENT 7: Context Length Scaling")
+    print(f"  EXPERIMENT 7: Context Length Scaling ({mode_str})")
     print("=" * 76)
 
     model.eval()
@@ -178,21 +196,32 @@ def run_length_scaling(
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
 
-    ds = QADataset(
-        data_path,
-        tokenizer,
-        max_context_length=max(length_buckets) + 256,
-        max_prompt_length=config.data.max_prompt_length,
-        max_response_length=config.data.max_response_length,
-    )
-    collator = QACollator(pad_token_id=tokenizer.pad_token_id)
+    if stage == 1:
+        ds = NTPDataset(
+            data_path,
+            tokenizer,
+            max_context_length=max(length_buckets) + 256,
+            ntp_segment_len=config.data.ntp_segment_len,
+        )
+        collator = NTPCollator(pad_token_id=tokenizer.pad_token_id)
+        len_key = "doc_ids"
+    else:
+        ds = QADataset(
+            data_path,
+            tokenizer,
+            max_context_length=max(length_buckets) + 256,
+            max_prompt_length=config.data.max_prompt_length,
+            max_response_length=config.data.max_response_length,
+        )
+        collator = QACollator(pad_token_id=tokenizer.pad_token_id)
+        len_key = "context_ids"
 
     print(f"\n  Scanning {len(ds)} samples for length distribution...")
     buckets: dict[int, list[int]] = {b: [] for b in length_buckets}
 
     for idx in range(len(ds)):
         sample = ds[idx]
-        ctx_len = sample["context_ids"].shape[0]
+        ctx_len = sample[len_key].shape[0]
         for b in sorted(length_buckets):
             if ctx_len >= b and len(buckets[b]) < samples_per_bucket:
                 buckets[b].append(idx)
@@ -223,16 +252,28 @@ def run_length_scaling(
         with torch.no_grad():
             for batch in loader:
                 batch = to_device(batch, device)
-                outputs = model(
-                    context_ids=batch["context_ids"],
-                    context_mask=batch["context_mask"],
-                    prompt_ids=batch["prompt_ids"],
-                    prompt_mask=batch["prompt_mask"],
-                    response_ids=batch["response_ids"],
-                    response_mask=batch["response_mask"],
-                    distill_alpha=0.0,
-                )
-                batch_losses.append(outputs["qa_loss"].item())
+                if stage == 1:
+                    outputs = model(
+                        mode="ntp",
+                        doc_ids=batch["doc_ids"],
+                        doc_mask=batch["doc_mask"],
+                        segment_ids=batch["segment_ids"],
+                        segment_mask=batch["segment_mask"],
+                        segment_labels=batch["segment_labels"],
+                    )
+                    batch_losses.append(outputs["ntp_loss"].item())
+                else:
+                    outputs = model(
+                        mode="qa",
+                        context_ids=batch["context_ids"],
+                        context_mask=batch["context_mask"],
+                        prompt_ids=batch["prompt_ids"],
+                        prompt_mask=batch["prompt_mask"],
+                        response_ids=batch["response_ids"],
+                        response_mask=batch["response_mask"],
+                        distill_alpha=0.0,
+                    )
+                    batch_losses.append(outputs["qa_loss"].item())
 
         mean_loss = sum(batch_losses) / len(batch_losses)
         std_loss = (
@@ -279,7 +320,7 @@ def run_length_scaling(
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  Experiment 8 — Distillation Effectiveness
+#  Experiment 8 — Distillation Effectiveness (Stage 2 only)
 # ═══════════════════════════════════════════════════════════════════════
 
 def run_distillation_effectiveness(
@@ -293,10 +334,12 @@ def run_distillation_effectiveness(
     Measures:
       - KL divergence between student and teacher logit distributions
       - Token prediction agreement (argmax match rate)
+
+    Note: This experiment is only applicable to Stage 2 (QA) mode.
     """
 
     print("\n" + "=" * 76)
-    print("  EXPERIMENT 8: Distillation Effectiveness")
+    print("  EXPERIMENT 8: Distillation Effectiveness (QA Stage 2 only)")
     print("=" * 76)
 
     model.eval()
@@ -428,17 +471,26 @@ def main():
     args = parser.parse_args()
 
     experiments = [e.strip() for e in args.experiments.split(",")]
+
+    # Exp 8 is QA-only
+    if args.stage == 1 and "8" in experiments:
+        print("NOTE: Experiment 8 (Distillation) is only for Stage 2 (QA). Skipping.")
+        experiments = [e for e in experiments if e != "8"]
+
     device = detect_device()
     torch_dtype = detect_dtype(device, args.no_bf16)
 
     wandb_run = init_wandb(
         enabled=args.wandb,
         project=args.wandb_project,
-        run_name="post-training-diag",
-        config={"checkpoint": args.checkpoint, "experiments": experiments},
+        run_name=f"post-training-diag-stage{args.stage}",
+        config={"stage": args.stage, "checkpoint": args.checkpoint,
+                "experiments": experiments},
         entity=args.wandb_entity,
     )
 
+    mode_str = "NTP (Stage 1)" if args.stage == 1 else "QA (Stage 2)"
+    print(f"Mode: {mode_str}")
     print(f"Device: {device}  dtype: {torch_dtype}")
     config = Config.from_yaml(args.config)
 
@@ -451,28 +503,32 @@ def main():
 
     data_path = args.data_path
     if data_path is None:
-        for p in ["data/qa_dev.json", "data/qa_tiny.json"]:
-            if os.path.exists(p):
-                data_path = p
-                break
+        data_path = auto_detect_data_path(args.stage)
         if data_path is None:
-            print("ERROR: No QA data found. Provide --data_path.")
+            print("ERROR: No data found. Provide --data_path.")
             sys.exit(1)
 
     # ── experiments ───────────────────────────────────────────────────
     all_results = {}
 
     if any(e in experiments for e in ("6", "8")):
-        eval_loader, tokenizer = prepare_qa_loader(
-            config, data_path, args.batch_size,
-            max_samples=args.max_samples,
-        )
-        print(f"\n  QA eval loader: {len(eval_loader)} batches")
+        if args.stage == 1:
+            eval_loader, tokenizer = prepare_ntp_loader(
+                config, data_path, args.batch_size,
+                max_samples=args.max_samples,
+            )
+        else:
+            eval_loader, tokenizer = prepare_qa_loader(
+                config, data_path, args.batch_size,
+                max_samples=args.max_samples,
+            )
+        print(f"\n  Eval loader: {len(eval_loader)} batches")
 
     if "6" in experiments:
         torch.manual_seed(42)
         exp6 = run_compression_fidelity(
-            model, eval_loader, device, max_batches=args.max_batches
+            model, eval_loader, device, stage=args.stage,
+            max_batches=args.max_batches,
         )
         all_results["fidelity"] = exp6
         if wandb_run:
@@ -482,7 +538,7 @@ def main():
         torch.manual_seed(42)
         length_buckets = [int(x) for x in args.length_buckets.split(",")]
         exp7 = run_length_scaling(
-            model, data_path, config, device,
+            model, data_path, config, device, stage=args.stage,
             length_buckets=length_buckets,
         )
         all_results["length_scaling"] = exp7

@@ -292,7 +292,121 @@ class TaskCompressorModel(nn.Module):
         self._resume_gradient_checkpointing(gc_was_on)
         return outputs.logits
 
-    def forward(
+    def compress_ntp(
+        self,
+        encoder_hidden: torch.Tensor,
+        encoder_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compress encoder hidden states *without* prompt conditioning (NTP).
+
+        Uses ``prompt_encoder.latent_tokens`` directly (skip cross-attention)
+        concatenated with ``context_tokens`` as the query for the Perceiver.
+
+        Returns:
+            (B, k, D) compressed soft prompts where k = n_p + n_c.
+        """
+        B = encoder_hidden.shape[0]
+
+        # Base latent tokens (no cross-attention over prompt)
+        prompt_latents = self.prompt_encoder.latent_tokens.unsqueeze(0).expand(B, -1, -1)
+
+        # Learnable context tokens
+        ctx_tokens = self.context_tokens.unsqueeze(0).expand(B, -1, -1)
+
+        # Concatenate query: (B, k, D)
+        query = torch.cat([prompt_latents, ctx_tokens], dim=1)
+
+        return self.perceiver(query, encoder_hidden, encoder_mask)
+
+    def forward_ntp(
+        self,
+        doc_ids: torch.Tensor,
+        doc_mask: torch.Tensor,
+        segment_ids: torch.Tensor,
+        segment_mask: torch.Tensor,
+        segment_labels: torch.Tensor,
+    ) -> dict:
+        """NTP forward pass — compress document, predict continuation segment.
+
+        Sequence: [compressed | sep | segment]
+        Labels: -100 for compressed+sep, segment_labels for segment positions.
+
+        Returns dict with ``loss``, ``ntp_loss``, ``distill_loss`` (always 0).
+        """
+        device = doc_ids.device
+
+        # 1. Encode document (LoRA on)
+        encoder_hidden = self.encode(doc_ids, doc_mask)
+
+        # 2. Compress without prompt conditioning
+        compressed = self.compress_ntp(encoder_hidden, doc_mask)
+
+        # 3. Decode: build [compressed | sep | segment]
+        gc_was_on = self._pause_gradient_checkpointing()
+        self._disable_adapter_forward_only()
+
+        B = compressed.shape[0]
+        k = compressed.shape[1]
+
+        embed_layer = self.get_embedding_layer()
+        segment_embeds = embed_layer(segment_ids)  # (B, L_s, D)
+        sep = self.separator.unsqueeze(0).expand(B, -1, -1)  # (B, 1, D)
+
+        inputs_embeds = torch.cat([compressed, sep, segment_embeds], dim=1)
+
+        prefix_mask = torch.ones(B, k + 1, device=device, dtype=segment_mask.dtype)
+        attn_mask = torch.cat([prefix_mask, segment_mask], dim=1)
+
+        outputs = self.base_model(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attn_mask,
+            return_dict=True,
+        )
+        logits = outputs.logits  # (B, total_len, V)
+
+        self._enable_adapter_forward_only()
+        self._resume_gradient_checkpointing(gc_was_on)
+
+        # 4. Build labels: only segment positions
+        L_s = segment_ids.shape[1]
+        prefix_len = k + 1
+        total_len = inputs_embeds.shape[1]
+
+        labels = torch.full(
+            (B, total_len), -100, dtype=torch.long, device=device
+        )
+        labels[:, prefix_len: prefix_len + L_s] = segment_labels
+        # Mask padding in segment
+        pad_positions = segment_mask == 0
+        labels[:, prefix_len: prefix_len + L_s][pad_positions] = -100
+
+        # 5. CE loss (shift-by-one)
+        shift_logits = logits[:, :-1, :].contiguous()
+        shift_labels = labels[:, 1:].contiguous()
+        ntp_loss = F.cross_entropy(
+            shift_logits.view(-1, shift_logits.shape[-1]),
+            shift_labels.view(-1),
+            ignore_index=-100,
+        )
+
+        return {
+            "loss": ntp_loss,
+            "ntp_loss": ntp_loss,
+            "distill_loss": torch.tensor(0.0, device=device),
+        }
+
+    def forward(self, *, mode: str = "qa", **kwargs) -> dict:
+        """Dispatch to mode-specific forward pass.
+
+        Args:
+            mode: ``"qa"`` (default) or ``"ntp"``.
+            **kwargs: forwarded to ``forward_qa`` or ``forward_ntp``.
+        """
+        if mode == "ntp":
+            return self.forward_ntp(**kwargs)
+        return self.forward_qa(**kwargs)
+
+    def forward_qa(
         self,
         context_ids: torch.Tensor,
         context_mask: torch.Tensor,
@@ -308,7 +422,7 @@ class TaskCompressorModel(nn.Module):
         distill_temperature: float = 2.0,
         distill_method: str = "kl",
     ) -> dict:
-        """Full training forward pass.
+        """Full QA training forward pass.
 
         Returns dict with ``loss``, ``qa_loss``, ``distill_loss``.
         """

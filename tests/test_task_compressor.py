@@ -237,3 +237,121 @@ class TestTaskCompressorModel:
         ratio = trainable / total
         # LoRA should be a small fraction (< 10% for rank=8 on tiny model)
         assert ratio < 0.15, f"LoRA param ratio too high: {ratio:.2%}"
+
+
+class TestForwardNTP:
+    """Tests for NTP (next-token prediction) forward pass."""
+
+    @pytest.fixture
+    def model(self):
+        return _build_tiny_model()
+
+    def test_forward_ntp_returns_losses(self, model):
+        B = 2
+        doc_ids = torch.randint(0, VOCAB_SIZE, (B, 16))
+        doc_mask = torch.ones(B, 16, dtype=torch.long)
+        seg_ids = torch.randint(0, VOCAB_SIZE, (B, 8))
+        seg_mask = torch.ones(B, 8, dtype=torch.long)
+        seg_labels = seg_ids.clone()
+
+        outputs = model(
+            mode="ntp",
+            doc_ids=doc_ids,
+            doc_mask=doc_mask,
+            segment_ids=seg_ids,
+            segment_mask=seg_mask,
+            segment_labels=seg_labels,
+        )
+        assert "loss" in outputs
+        assert "ntp_loss" in outputs
+        assert "distill_loss" in outputs
+        assert outputs["loss"].item() > 0
+        assert outputs["distill_loss"].item() == 0.0
+
+    def test_forward_ntp_backward(self, model):
+        B = 2
+        doc_ids = torch.randint(0, VOCAB_SIZE, (B, 16))
+        doc_mask = torch.ones(B, 16, dtype=torch.long)
+        seg_ids = torch.randint(0, VOCAB_SIZE, (B, 8))
+        seg_mask = torch.ones(B, 8, dtype=torch.long)
+        seg_labels = seg_ids.clone()
+
+        outputs = model(
+            mode="ntp",
+            doc_ids=doc_ids,
+            doc_mask=doc_mask,
+            segment_ids=seg_ids,
+            segment_mask=seg_mask,
+            segment_labels=seg_labels,
+        )
+        outputs["loss"].backward()
+
+        # LoRA parameters should have gradients
+        lora_has_grad = False
+        for name, p in model.named_parameters():
+            if "lora" in name.lower() and p.requires_grad:
+                if p.grad is not None and p.grad.abs().sum() > 0:
+                    lora_has_grad = True
+                    break
+        assert lora_has_grad, "LoRA parameters should have gradients in NTP mode"
+
+        # Perceiver parameters should have gradients
+        perceiver_has_grad = False
+        for name, p in model.named_parameters():
+            if "perceiver" in name and p.requires_grad:
+                if p.grad is not None and p.grad.abs().sum() > 0:
+                    perceiver_has_grad = True
+                    break
+        assert perceiver_has_grad, "Perceiver parameters should have gradients in NTP mode"
+
+        # Context tokens should have gradients
+        assert model.context_tokens.grad is not None
+        assert model.context_tokens.grad.abs().sum() > 0, \
+            "context_tokens should have gradients in NTP mode"
+
+    def test_forward_mode_dispatch(self, model):
+        """mode='ntp' and mode='qa' should route to different methods."""
+        B = 2
+        # NTP inputs
+        doc_ids = torch.randint(0, VOCAB_SIZE, (B, 16))
+        doc_mask = torch.ones(B, 16, dtype=torch.long)
+        seg_ids = torch.randint(0, VOCAB_SIZE, (B, 8))
+        seg_mask = torch.ones(B, 8, dtype=torch.long)
+        seg_labels = seg_ids.clone()
+
+        ntp_out = model(
+            mode="ntp",
+            doc_ids=doc_ids,
+            doc_mask=doc_mask,
+            segment_ids=seg_ids,
+            segment_mask=seg_mask,
+            segment_labels=seg_labels,
+        )
+        assert "ntp_loss" in ntp_out
+
+        # QA inputs
+        ctx_ids = torch.randint(0, VOCAB_SIZE, (B, 16))
+        ctx_mask = torch.ones(B, 16, dtype=torch.long)
+        prompt_ids = torch.randint(0, VOCAB_SIZE, (B, 8))
+        prompt_mask = torch.ones(B, 8, dtype=torch.long)
+        resp_ids = torch.randint(0, VOCAB_SIZE, (B, 6))
+        resp_mask = torch.ones(B, 6, dtype=torch.long)
+
+        qa_out = model(
+            mode="qa",
+            context_ids=ctx_ids,
+            context_mask=ctx_mask,
+            prompt_ids=prompt_ids,
+            prompt_mask=prompt_mask,
+            response_ids=resp_ids,
+            response_mask=resp_mask,
+            distill_alpha=0.0,
+        )
+        assert "qa_loss" in qa_out
+
+    def test_compress_ntp_output_shape(self, model):
+        k = model.config.n_prompt_tokens + model.config.n_context_tokens
+        encoder_hidden = torch.randn(2, 32, HIDDEN_SIZE)
+        encoder_mask = torch.ones(2, 32)
+        compressed = model.compress_ntp(encoder_hidden, encoder_mask)
+        assert compressed.shape == (2, k, HIDDEN_SIZE)

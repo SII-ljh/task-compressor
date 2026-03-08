@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare training datasets for Task Compressor.
+"""Prepare training datasets for Deep Compressor.
 
 Default: download complete datasets for recommended training (~1.7B tokens).
 --test:       download small subsets for quick MacBook validation.
@@ -730,7 +730,7 @@ def main():
     subset_mode = args.make_tiny or args.make_dev or args.make_ablation or args.make_all_subsets
     if subset_mode:
         print("=" * 60)
-        print("Task Compressor — Subset Generation")
+        print("Deep Compressor — Subset Generation")
         print(f"Project root: {PROJECT_ROOT}")
         print("=" * 60)
         print()
@@ -748,7 +748,7 @@ def main():
 
     mode = "TEST (small subsets)" if args.test else "FULL (~1.7B tokens target)"
     print("=" * 60)
-    print(f"Task Compressor — Data Preparation [{mode}]")
+    print(f"Deep Compressor — Data Preparation [{mode}]")
     print(f"Project root: {PROJECT_ROOT}")
     print("=" * 60)
     print()

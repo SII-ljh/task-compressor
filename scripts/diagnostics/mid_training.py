@@ -4,14 +4,18 @@
 Exp 4 — Query Diversity/Utilization: Check query collapse, dead queries, effective rank.
 Exp 5 — Perceiver Layer-wise Information Gain: Measure loss at each layer's output.
 
-Can be run standalone (with optional checkpoint) or as a callback during training.
+Supports both Stage 1 (NTP) and Stage 2 (QA) modes.
 
 Usage (standalone):
-    python scripts/diagnostics/mid_training.py \
+    # Stage 1 (NTP)
+    python scripts/diagnostics/mid_training.py --stage 1 \
+        --config configs/default.yaml --experiments 4,5
+
+    # Stage 2 (QA), with checkpoint
+    python scripts/diagnostics/mid_training.py --stage 2 \
         --config configs/default.yaml \
-        --data_path data/qa_dev.json \
         --checkpoint outputs/checkpoint.pt \
-        --experiments 4,5
+        --data_path ../deep_compressor/data/qa_dev.json
 """
 
 from __future__ import annotations
@@ -25,6 +29,7 @@ import torch
 import torch.nn.functional as F
 
 from scripts.diagnostics.common import (
+    auto_detect_data_path,
     base_parser,
     detect_device,
     detect_dtype,
@@ -34,6 +39,7 @@ from scripts.diagnostics.common import (
     load_model,
     log_wandb,
     pairwise_cosine_similarity,
+    prepare_ntp_batch,
     prepare_qa_batch,
     to_device,
 )
@@ -51,6 +57,7 @@ def run_query_diversity(
     model,
     batch: dict,
     device: torch.device,
+    stage: int,
 ) -> dict:
     """Analyze query diversity and utilization after Perceiver compression.
 
@@ -58,22 +65,25 @@ def run_query_diversity(
     the soft prompt bottleneck.
     """
 
+    mode_str = "NTP" if stage == 1 else "QA"
     print("\n" + "=" * 76)
-    print("  EXPERIMENT 4: Query Diversity / Utilization")
+    print(f"  EXPERIMENT 4: Query Diversity / Utilization ({mode_str})")
     print("=" * 76)
 
     model.eval()
     k = model.config.n_prompt_tokens + model.config.n_context_tokens
 
     with torch.no_grad():
-        # Encode context
-        encoder_hidden = model.encode(batch["context_ids"], batch["context_mask"])
-
-        # Compress
-        compressed = model.compress(
-            encoder_hidden, batch["context_mask"],
-            batch["prompt_ids"], batch["prompt_mask"],
-        )  # (B, k, D)
+        if stage == 1:
+            encoder_hidden = model.encode(batch["doc_ids"], batch["doc_mask"])
+            compressed = model.compress_ntp(encoder_hidden, batch["doc_mask"])
+        else:
+            encoder_hidden = model.encode(batch["context_ids"], batch["context_mask"])
+            compressed = model.compress(
+                encoder_hidden, batch["context_mask"],
+                batch["prompt_ids"], batch["prompt_mask"],
+            )
+        # (B, k, D)
 
         # Analyze first sample's compressed vectors
         latent = compressed[0]  # (k, D)
@@ -168,6 +178,7 @@ def run_layerwise_info_gain(
     model,
     batch: dict,
     device: torch.device,
+    stage: int,
 ) -> dict:
     """Measure loss at progressive truncation points through the Perceiver layers.
 
@@ -175,37 +186,88 @@ def run_layerwise_info_gain(
     decode loss at each stage.
     """
 
+    mode_str = "NTP" if stage == 1 else "QA"
     print("\n" + "=" * 76)
-    print("  EXPERIMENT 5: Perceiver Layer-wise Information Gain")
+    print(f"  EXPERIMENT 5: Perceiver Layer-wise Information Gain ({mode_str})")
     print("=" * 76)
 
     model.eval()
-    B = batch["context_ids"].shape[0]
     perceiver = model.perceiver
 
-    with torch.no_grad():
-        # Encode context
-        encoder_hidden = model.encode(batch["context_ids"], batch["context_mask"])
-        encoder_mask = batch["context_mask"]
+    if stage == 1:
+        B = batch["doc_ids"].shape[0]
+        segment_ids = batch["segment_ids"]
+        segment_mask = batch["segment_mask"]
+        segment_labels = batch["segment_labels"]
+    else:
+        B = batch["context_ids"].shape[0]
 
-        # Build query (same as compress())
-        prompt_latents = model.prompt_encoder(batch["prompt_ids"], batch["prompt_mask"])
+    with torch.no_grad():
+        # Encode
+        if stage == 1:
+            encoder_hidden = model.encode(batch["doc_ids"], batch["doc_mask"])
+            encoder_mask = batch["doc_mask"]
+            # Build query (same as compress_ntp)
+            prompt_latents = model.prompt_encoder.latent_tokens.unsqueeze(0).expand(B, -1, -1)
+        else:
+            encoder_hidden = model.encode(batch["context_ids"], batch["context_mask"])
+            encoder_mask = batch["context_mask"]
+            # Build query (same as compress)
+            prompt_latents = model.prompt_encoder(batch["prompt_ids"], batch["prompt_mask"])
+
         ctx_tokens = model.context_tokens.unsqueeze(0).expand(B, -1, -1)
         query = torch.cat([prompt_latents, ctx_tokens], dim=1)
 
         # Helper: compute loss from intermediate query state
         def _loss_from_query(q: torch.Tensor) -> float:
             normed = perceiver.final_ln(q)
-            dec_out = model.decode_train(
-                normed,
-                batch["prompt_ids"], batch["prompt_mask"],
-                batch["response_ids"], batch["response_mask"],
-            )
-            shift_logits = dec_out["logits"][:, :-1, :].contiguous()
-            labels = dec_out["labels"][:, 1:].contiguous()
+
+            if stage == 1:
+                # NTP decode: [compressed | sep | segment]
+                gc_was_on = model._pause_gradient_checkpointing()
+                model._disable_adapter_forward_only()
+
+                embed_layer = model.get_embedding_layer()
+                seg_embeds = embed_layer(segment_ids)
+                sep = model.separator.unsqueeze(0).expand(B, -1, -1)
+                inputs_embeds = torch.cat([normed, sep, seg_embeds], dim=1)
+
+                k_len = normed.shape[1]
+                prefix_mask = torch.ones(B, k_len + 1, device=device, dtype=segment_mask.dtype)
+                attn_mask = torch.cat([prefix_mask, segment_mask], dim=1)
+
+                outputs = model.base_model(
+                    inputs_embeds=inputs_embeds,
+                    attention_mask=attn_mask,
+                    return_dict=True,
+                )
+                logits = outputs.logits
+
+                model._enable_adapter_forward_only()
+                model._resume_gradient_checkpointing(gc_was_on)
+
+                L_s = segment_ids.shape[1]
+                prefix_len = k_len + 1
+                total_len = inputs_embeds.shape[1]
+                labels = torch.full((B, total_len), -100, dtype=torch.long, device=device)
+                labels[:, prefix_len: prefix_len + L_s] = segment_labels
+                pad_positions = segment_mask == 0
+                labels[:, prefix_len: prefix_len + L_s][pad_positions] = -100
+
+                shift_logits = logits[:, :-1, :].contiguous()
+                shift_labels = labels[:, 1:].contiguous()
+            else:
+                dec_out = model.decode_train(
+                    normed,
+                    batch["prompt_ids"], batch["prompt_mask"],
+                    batch["response_ids"], batch["response_mask"],
+                )
+                shift_logits = dec_out["logits"][:, :-1, :].contiguous()
+                shift_labels = dec_out["labels"][:, 1:].contiguous()
+
             loss = F.cross_entropy(
                 shift_logits.view(-1, shift_logits.shape[-1]),
-                labels.view(-1),
+                shift_labels.view(-1),
                 ignore_index=-100,
             )
             return loss.item()
@@ -232,15 +294,15 @@ def run_layerwise_info_gain(
     gains = {}
     total_gain = losses[0] - losses[-1] if len(losses) > 1 else 0.0
 
-    for i, (stage, loss) in enumerate(zip(stages, losses)):
+    for i, (stage_name, loss) in enumerate(zip(stages, losses)):
         if i == 0:
             gain = 0.0
             gain_pct = 0.0
         else:
             gain = losses[i - 1] - loss
             gain_pct = (gain / max(abs(total_gain), 1e-10)) * 100
-        gains[stage] = gain
-        print(f"  {stage:<25}  {loss:>10.4f}  {gain:>+10.4f}  {gain_pct:>9.1f}%")
+        gains[stage_name] = gain
+        print(f"  {stage_name:<25}  {loss:>10.4f}  {gain:>+10.4f}  {gain_pct:>9.1f}%")
 
     print(f"  {'─' * 60}")
     print(f"  {'Total gain':<25}  {'':>10}  {total_gain:>+10.4f}  {'100.0':>9}%")
@@ -263,8 +325,8 @@ def run_layerwise_info_gain(
             print("  PASS — All Perceiver layers contribute positively")
 
     results = {"checkpoints": checkpoints, "gains": gains, "total_gain": total_gain}
-    for stage, loss in checkpoints.items():
-        results[f"loss_{stage}"] = loss
+    for stage_name, loss in checkpoints.items():
+        results[f"loss_{stage_name}"] = loss
     return results
 
 
@@ -292,11 +354,14 @@ def main():
     wandb_run = init_wandb(
         enabled=args.wandb,
         project=args.wandb_project,
-        run_name="mid-training-diag",
-        config={"checkpoint": args.checkpoint, "experiments": experiments},
+        run_name=f"mid-training-diag-stage{args.stage}",
+        config={"stage": args.stage, "checkpoint": args.checkpoint,
+                "experiments": experiments},
         entity=args.wandb_entity,
     )
 
+    mode_str = "NTP (Stage 1)" if args.stage == 1 else "QA (Stage 2)"
+    print(f"Mode: {mode_str}")
     print(f"Device: {device}  dtype: {torch_dtype}")
     config = Config.from_yaml(args.config)
 
@@ -309,25 +374,27 @@ def main():
 
     data_path = args.data_path
     if data_path is None:
-        for p in ["data/qa_dev.json", "data/qa_tiny.json", "data/qa_train.json"]:
-            if os.path.exists(p):
-                data_path = p
-                break
+        data_path = auto_detect_data_path(args.stage)
         if data_path is None:
-            print("ERROR: No QA data found. Provide --data_path.")
+            print("ERROR: No data found. Provide --data_path.")
             sys.exit(1)
 
-    print(f"\nPreparing single QA batch from {data_path}...")
-    batch, tokenizer = prepare_qa_batch(
-        config, data_path, args.batch_size, device
-    )
+    print(f"\nPreparing single batch from {data_path}...")
+    if args.stage == 1:
+        batch, tokenizer = prepare_ntp_batch(
+            config, data_path, args.batch_size, device
+        )
+    else:
+        batch, tokenizer = prepare_qa_batch(
+            config, data_path, args.batch_size, device
+        )
 
     # ── experiments ───────────────────────────────────────────────────
     all_results = {}
 
     if "4" in experiments:
         torch.manual_seed(42)
-        exp4 = run_query_diversity(model, batch, device)
+        exp4 = run_query_diversity(model, batch, device, stage=args.stage)
         all_results["query_diversity"] = exp4
         if wandb_run:
             log_wandb(
@@ -338,7 +405,7 @@ def main():
 
     if "5" in experiments:
         torch.manual_seed(42)
-        exp5 = run_layerwise_info_gain(model, batch, device)
+        exp5 = run_layerwise_info_gain(model, batch, device, stage=args.stage)
         all_results["layerwise_gain"] = exp5
         if wandb_run:
             log_wandb(

@@ -132,7 +132,7 @@ def main():
                 return
 
     print("=" * 60)
-    print("Task Compressor - Model Download")
+    print("Deep Compressor - Model Download")
     print(f"Models: {', '.join(sizes)}")
     print(f"Target: {MODEL_BASE_DIR}")
     print(f"Dtype:  {args.dtype}")
