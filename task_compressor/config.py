@@ -1,6 +1,7 @@
 """Configuration dataclasses for Task Compressor."""
 
 import dataclasses
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
@@ -94,7 +95,21 @@ class Config:
         for k in ["output_dir", "wandb_project", "wandb_run_name", "seed"]:
             if k in raw:
                 setattr(config, k, raw[k])
+
+        # Resolve relative paths to absolute so from_pretrained() finds local dirs
+        config._resolve_paths()
         return config
+
+    def _resolve_paths(self) -> None:
+        """Convert relative paths to absolute if they exist on disk."""
+        for attr in ("base_model",):
+            val = getattr(self.model, attr)
+            if val and not os.path.isabs(val) and os.path.isdir(val):
+                setattr(self.model, attr, os.path.abspath(val))
+        for attr in ("train_file", "dev_file", "ntp_train_file"):
+            val = getattr(self.data, attr)
+            if val and not os.path.isabs(val) and os.path.exists(val):
+                setattr(self.data, attr, os.path.abspath(val))
 
     @staticmethod
     def _cast(current_value, new_value: str):
