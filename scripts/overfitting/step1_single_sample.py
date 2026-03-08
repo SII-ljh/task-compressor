@@ -249,8 +249,8 @@ def main():
 
     parser.add_argument("--steps", type=int, default=300,
                         help="Total training steps (default: 300)")
-    parser.add_argument("--lr", type=float, default=1e-3,
-                        help="Peak learning rate (default: 1e-3)")
+    parser.add_argument("--lr", type=float, default=3e-4,
+                        help="Peak learning rate (default: 3e-4)")
     parser.add_argument("--warmup", type=int, default=20,
                         help="Warmup steps (default: 20)")
     parser.add_argument("--scheduler", type=str, default="cosine",

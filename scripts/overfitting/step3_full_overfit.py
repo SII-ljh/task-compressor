@@ -319,8 +319,8 @@ def main():
 
     parser.add_argument("--steps", type=int, default=20000,
                         help="Total training steps (default: 20000)")
-    parser.add_argument("--lr", type=float, default=5e-4,
-                        help="Peak learning rate (default: 5e-4)")
+    parser.add_argument("--lr", type=float, default=3e-4,
+                        help="Peak learning rate (default: 3e-4)")
     parser.add_argument("--batch_size", type=int, default=4,
                         help="Batch size (default: 4)")
     parser.add_argument("--grad_accum", type=int, default=2,
