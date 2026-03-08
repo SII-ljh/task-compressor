@@ -93,13 +93,30 @@ def evaluate(model, loader, device, stage, use_bf16=False):
 
 # ── Training loop ─────────────────────────────────────────────────────
 
+def _build_optimizer(model, lr, lora_lr):
+    """Build optimizer with differential learning rates (perceiver vs LoRA)."""
+    lora_params = []
+    new_params = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if "lora" in name.lower():
+            lora_params.append(param)
+        else:
+            new_params.append(param)
+    groups = [
+        {"params": new_params, "lr": lr},
+        {"params": lora_params, "lr": lora_lr},
+    ]
+    logger.info(f"Optimizer: {len(new_params)} new params (lr={lr:.2e}), "
+                f"{len(lora_params)} LoRA params (lr={lora_lr:.2e})")
+    return torch.optim.AdamW(groups, weight_decay=0.0)
+
+
 def train(model, train_loader, device, args, use_bf16=False):
     """Single-sample training loop — no val split."""
 
-    optimizer = torch.optim.AdamW(
-        [p for p in model.parameters() if p.requires_grad],
-        lr=args.lr, weight_decay=0.0,
-    )
+    optimizer = _build_optimizer(model, args.lr, args.lora_lr)
 
     from torch.optim.lr_scheduler import LambdaLR
 
@@ -169,6 +186,12 @@ def train(model, train_loader, device, args, use_bf16=False):
                     loss_key = "qa_loss"
 
             loss = outputs["loss"]
+            if torch.isnan(loss) or torch.isinf(loss):
+                logger.error(f"NaN/Inf loss at step {step+1}, stopping training.")
+                logger.error("Try: lower --lr or --lora_lr, or use --no_bf16")
+                metrics = {"loss": float("nan"), "perplexity": float("inf")}
+                csv_file.close()
+                return metrics
             loss.backward()
             running_loss += outputs[loss_key].float().item()
             running_count += 1
@@ -250,7 +273,9 @@ def main():
     parser.add_argument("--steps", type=int, default=300,
                         help="Total training steps (default: 300)")
     parser.add_argument("--lr", type=float, default=3e-4,
-                        help="Peak learning rate (default: 3e-4)")
+                        help="Peak learning rate for perceiver/tokens (default: 3e-4)")
+    parser.add_argument("--lora_lr", type=float, default=None,
+                        help="LoRA learning rate (default: lr/5)")
     parser.add_argument("--warmup", type=int, default=20,
                         help="Warmup steps (default: 20)")
     parser.add_argument("--scheduler", type=str, default="cosine",
@@ -265,6 +290,10 @@ def main():
                         default="outputs/overfit_step1")
 
     args = parser.parse_args()
+
+    # Default LoRA lr = lr / 5 (matches main trainer's 5:1 ratio)
+    if args.lora_lr is None:
+        args.lora_lr = args.lr / 5
 
     # Auto-detect data path based on stage
     if args.data_path is None:
@@ -310,7 +339,7 @@ def main():
         logger.info(f"GPU: {gpu_name} ({gpu_mem:.0f} GB)")
     logger.info(f"bf16: {'ON' if use_bf16 else 'OFF'}")
     logger.info(f"Data: {args.data_path}")
-    logger.info(f"Steps: {args.steps}  LR: {args.lr}")
+    logger.info(f"Steps: {args.steps}  LR: {args.lr}  LoRA_LR: {args.lora_lr}")
 
     # Load config & model
     config = Config.from_yaml(args.config)
