@@ -279,19 +279,19 @@ def auto_detect_data_path(stage: int) -> Optional[str]:
     """Auto-detect data path based on training stage."""
     if stage == 1:
         candidates = [
-            "../deep_compressor/data/ntp_tiny.jsonl",
-            "../deep_compressor/data/ntp_train.jsonl",
             "data/ntp_tiny.jsonl",
             "data/ntp_train.jsonl",
+            "../deep_compressor/data/ntp_tiny.jsonl",
+            "../deep_compressor/data/ntp_train.jsonl",
         ]
     else:
         candidates = [
-            "../deep_compressor/data/qa_tiny_train.json",
-            "../deep_compressor/data/qa_dev.json",
-            "../deep_compressor/data/qa_train.json",
             "data/qa_tiny_train.json",
             "data/qa_dev.json",
             "data/qa_train.json",
+            "../deep_compressor/data/qa_tiny_train.json",
+            "../deep_compressor/data/qa_dev.json",
+            "../deep_compressor/data/qa_train.json",
         ]
     for p in candidates:
         if os.path.exists(p):
