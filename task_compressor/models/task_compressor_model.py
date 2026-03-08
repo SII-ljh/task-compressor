@@ -396,8 +396,8 @@ class TaskCompressorModel(nn.Module):
         pad_positions = segment_mask == 0
         labels[:, prefix_len: prefix_len + L_s][pad_positions] = -100
 
-        # 5. CE loss (shift-by-one)
-        shift_logits = logits[:, :-1, :].contiguous()
+        # 5. CE loss (shift-by-one, fp32 for numerical safety)
+        shift_logits = logits[:, :-1, :].contiguous().float()
         shift_labels = labels[:, 1:].contiguous()
         ntp_loss = F.cross_entropy(
             shift_logits.view(-1, shift_logits.shape[-1]),
@@ -461,8 +461,8 @@ class TaskCompressorModel(nn.Module):
         labels = dec_out["labels"]
         prefix_len = dec_out["prefix_len"]
 
-        # 4. QA loss (CE on response tokens)
-        shift_logits = student_logits[:, :-1, :].contiguous()
+        # 4. QA loss (CE on response tokens, fp32 for numerical safety)
+        shift_logits = student_logits[:, :-1, :].contiguous().float()
         shift_labels = labels[:, 1:].contiguous()
         qa_loss = F.cross_entropy(
             shift_logits.view(-1, shift_logits.shape[-1]),
@@ -496,8 +496,8 @@ class TaskCompressorModel(nn.Module):
                 teacher_resp[i, :length] = teacher_logits[i, start: start + length].to(student_resp.dtype)
 
             if distill_method == "kl":
-                student_log_p = F.log_softmax(student_resp / distill_temperature, dim=-1)
-                teacher_p = F.softmax(teacher_resp / distill_temperature, dim=-1)
+                student_log_p = F.log_softmax(student_resp.float() / distill_temperature, dim=-1)
+                teacher_p = F.softmax(teacher_resp.float() / distill_temperature, dim=-1)
                 kl = F.kl_div(student_log_p, teacher_p, reduction="none").sum(-1)
                 kl = kl * response_mask.float()
                 distill_loss = kl.sum() / response_mask.float().sum().clamp(min=1)

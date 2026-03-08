@@ -319,8 +319,8 @@ def main():
     parser.add_argument("--save_every", type=int, default=500,
                         help="Save every N steps (default: 500)")
 
-    parser.add_argument("--max_grad_norm", type=float, default=1.0,
-                        help="Max gradient norm for clipping (default: 1.0)")
+    parser.add_argument("--max_grad_norm", type=float, default=5.0,
+                        help="Max gradient norm for clipping (default: 5.0)")
     parser.add_argument("--no_bf16", action="store_true",
                         help="Disable bf16 mixed precision")
     parser.add_argument("--output_dir", type=str,
