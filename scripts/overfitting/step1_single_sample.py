@@ -239,7 +239,7 @@ def train(model, train_loader, device, args, use_bf16=False):
                     f"elapsed={elapsed:.0f}s  epoch={epoch}"
                 )
                 csv_writer.writerow([step, f"{avg:.4f}", f"{ppl:.1f}",
-                                     f"{lr:.2e}", f"{elapsed:.0f}"])
+                                     f"{lr_perc:.2e}", f"{elapsed:.0f}"])
                 csv_file.flush()
 
                 if avg < best_loss:

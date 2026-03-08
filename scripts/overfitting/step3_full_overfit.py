@@ -280,7 +280,6 @@ def train(model, train_loader, val_loader, device, args, use_bf16=False):
                     metrics = evaluate(model, val_loader, device, args.stage,
                                        use_bf16=use_bf16, distill_alpha=args.distill_alpha)
                     elapsed = time.time() - t0
-                    lr = scheduler.get_last_lr()[0]
 
                     improved = ""
                     if metrics["perplexity"] < best_ppl:
@@ -296,7 +295,7 @@ def train(model, train_loader, val_loader, device, args, use_bf16=False):
                     csv_writer.writerow([
                         step, "", f"{metrics['loss']:.4f}",
                         f"{metrics['task_loss']:.4f}", f"{metrics['perplexity']:.1f}",
-                        f"{lr:.2e}", f"{elapsed:.0f}",
+                        f"{lr_perc:.2e}", f"{elapsed:.0f}",
                     ])
                     csv_file.flush()
                     model.train()
