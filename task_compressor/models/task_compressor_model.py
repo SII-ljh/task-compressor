@@ -83,6 +83,22 @@ class TaskCompressorModel(nn.Module):
             num_layers=config.num_perceiver_layers,
         ).to(torch_dtype)
 
+        # ── 5b. Match Perceiver output scale to Qwen embedding scale ───
+        # final_ln outputs unit-variance (~1.0) by default, but the Qwen
+        # decoder expects input embeddings at std≈0.03.  A ~34x scale
+        # mismatch causes the decoder to produce extreme logits → large
+        # gradients → bf16 overflow → NaN.  Fix: set final_ln gamma to
+        # the embedding std so the Perceiver output starts at the right
+        # scale.  The gamma is learnable and will adapt during training.
+        with torch.no_grad():
+            embed_std = (
+                self.get_embedding_layer()
+                .weight.float()
+                .std()
+                .item()
+            )
+        nn.init.constant_(self.perceiver.final_ln.weight, embed_std)
+
         # ── 6. Separator token ───────────────────────────────────────────
         self.separator = nn.Parameter(
             torch.randn(1, hidden_size, dtype=torch_dtype) * 0.02

@@ -96,13 +96,39 @@ def evaluate(model, loader, device, stage, use_bf16=False):
 
 # ── Training loop ─────────────────────────────────────────────────────
 
+def _compute_group_grad_norms(model):
+    """Compute per-group gradient L2 norms for diagnostics."""
+    lora_sq, perceiver_sq, other_sq = 0.0, 0.0, 0.0
+    for name, p in model.named_parameters():
+        if p.grad is None:
+            continue
+        g2 = p.grad.detach().float().pow(2).sum().item()
+        if "lora" in name.lower():
+            lora_sq += g2
+        elif any(k in name for k in ("perceiver", "prompt_encoder", "context_tokens", "separator")):
+            perceiver_sq += g2
+        else:
+            other_sq += g2
+    return lora_sq**0.5, perceiver_sq**0.5, other_sq**0.5
+
+
 def train(model, train_loader, device, args, use_bf16=False):
     """Batch memorization loop — no val split."""
 
-    optimizer = torch.optim.AdamW(
-        [p for p in model.parameters() if p.requires_grad],
-        lr=args.lr, weight_decay=0.0,
-    )
+    # Differential LR
+    lora_params, new_params = [], []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if "lora" in name.lower():
+            lora_params.append(p)
+        else:
+            new_params.append(p)
+
+    optimizer = torch.optim.AdamW([
+        {"params": new_params, "lr": args.lr},
+        {"params": lora_params, "lr": args.lora_lr},
+    ], weight_decay=0.0)
 
     from torch.optim.lr_scheduler import LambdaLR
 
@@ -186,6 +212,7 @@ def train(model, train_loader, device, args, use_bf16=False):
             micro_steps += 1
 
             if micro_steps % args.grad_accum == 0:
+                lora_gn, perc_gn, other_gn = _compute_group_grad_norms(model)
                 grad_norm = torch.nn.utils.clip_grad_norm_(
                     [p for p in model.parameters() if p.requires_grad],
                     args.max_grad_norm)
@@ -200,12 +227,15 @@ def train(model, train_loader, device, args, use_bf16=False):
                 if step % args.log_every == 0:
                     avg = running_loss / max(micro_steps, 1)
                     ppl = math.exp(min(avg, 20))
-                    lr = scheduler.get_last_lr()[0]
+                    lr_perc = scheduler.get_last_lr()[0]
+                    lr_lora = scheduler.get_last_lr()[1]
                     elapsed = time.time() - t0
                     logger.info(
                         f"step {step}/{args.steps}  "
-                        f"loss={avg:.4f}  ppl={ppl:.1f}  lr={lr:.2e}  "
+                        f"loss={avg:.4f}  ppl={ppl:.1f}  "
+                        f"lr_p={lr_perc:.2e}  lr_l={lr_lora:.2e}  "
                         f"grad_norm={grad_norm:.4f}  "
+                        f"[lora={lora_gn:.2f} perc={perc_gn:.2f}]  "
                         f"elapsed={elapsed:.0f}s  epoch={epoch}"
                     )
                     csv_writer.writerow([step, f"{avg:.4f}", f"{ppl:.1f}",
@@ -272,7 +302,9 @@ def main():
     parser.add_argument("--steps", type=int, default=2000,
                         help="Total training steps (default: 2000)")
     parser.add_argument("--lr", type=float, default=3e-4,
-                        help="Peak learning rate (default: 3e-4)")
+                        help="Peak LR for perceiver/tokens (default: 3e-4)")
+    parser.add_argument("--lora_lr", type=float, default=3e-5,
+                        help="Peak LR for LoRA params (default: 3e-5)")
     parser.add_argument("--batch_size", type=int, default=4,
                         help="Batch size (default: 4)")
     parser.add_argument("--grad_accum", type=int, default=1,
