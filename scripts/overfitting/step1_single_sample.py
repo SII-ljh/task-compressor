@@ -185,7 +185,7 @@ def train(model, train_loader, device, args, use_bf16=False):
                     )
                     loss_key = "qa_loss"
 
-            loss = outputs["loss"]
+            loss = outputs["loss"].float()  # fp32 backward for stability
             if torch.isnan(loss) or torch.isinf(loss):
                 logger.error(f"NaN/Inf loss at step {step+1}, stopping training.")
                 logger.error("Try: lower --lr or --lora_lr, or use --no_bf16")
@@ -270,10 +270,10 @@ def main():
     parser.add_argument("--data_path", type=str, default=None,
                         help="Data path (default: auto-detect based on stage)")
 
-    parser.add_argument("--steps", type=int, default=300,
-                        help="Total training steps (default: 300)")
-    parser.add_argument("--lr", type=float, default=3e-4,
-                        help="Peak learning rate for perceiver/tokens (default: 3e-4)")
+    parser.add_argument("--steps", type=int, default=500,
+                        help="Total training steps (default: 500)")
+    parser.add_argument("--lr", type=float, default=1e-4,
+                        help="Peak learning rate for perceiver/tokens (default: 1e-4)")
     parser.add_argument("--lora_lr", type=float, default=None,
                         help="LoRA learning rate (default: lr/5)")
     parser.add_argument("--warmup", type=int, default=20,

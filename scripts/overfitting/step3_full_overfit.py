@@ -218,7 +218,7 @@ def train(model, train_loader, val_loader, device, args, use_bf16=False):
                     )
                     task_loss_key = "qa_loss"
 
-            loss = outputs["loss"] / args.grad_accum
+            loss = outputs["loss"].float() / args.grad_accum  # fp32 backward for stability
             if torch.isnan(loss) or torch.isinf(loss):
                 logger.error(f"NaN/Inf loss at step {step+1}, stopping training.")
                 logger.error("Try: lower --lr or --lora_lr, or use --no_bf16")
@@ -341,8 +341,8 @@ def main():
 
     parser.add_argument("--steps", type=int, default=20000,
                         help="Total training steps (default: 20000)")
-    parser.add_argument("--lr", type=float, default=3e-4,
-                        help="Peak learning rate for perceiver/tokens (default: 3e-4)")
+    parser.add_argument("--lr", type=float, default=1e-4,
+                        help="Peak learning rate for perceiver/tokens (default: 1e-4)")
     parser.add_argument("--lora_lr", type=float, default=None,
                         help="LoRA learning rate (default: lr/5)")
     parser.add_argument("--batch_size", type=int, default=4,
