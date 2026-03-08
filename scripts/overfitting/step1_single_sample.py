@@ -26,6 +26,7 @@ import csv
 import logging
 import math
 import os
+import random
 import sys
 import time
 from pathlib import Path
@@ -390,8 +391,32 @@ def main():
         )
         collator = QACollator(pad_token_id=tokenizer.pad_token_id)
 
-    train_ds = Subset(full_ds, [0])  # single sample
     logger.info(f"Dataset: {len(full_ds)} total, using 1 sample for overfitting")
+
+    # For NTP mode, NTPDataset picks a random split point each __getitem__
+    # call.  Cache the sample once so every iteration sees the exact same
+    # (doc, segment) pair — required for a meaningful overfit test.
+    if args.stage == 1:
+        random.seed(42)
+        cached = full_ds[0]
+
+        class _CachedDataset(torch.utils.data.Dataset):
+            def __init__(self, sample):
+                self.sample = sample
+
+            def __len__(self):
+                return 1
+
+            def __getitem__(self, idx):
+                return {k: v.clone() if isinstance(v, torch.Tensor) else v
+                        for k, v in self.sample.items()}
+
+        train_ds = _CachedDataset(cached)
+        doc_len = cached["doc_ids"].shape[0]
+        seg_len = cached["segment_ids"].shape[0]
+        logger.info(f"Cached NTP sample: doc_len={doc_len}, segment_len={seg_len}")
+    else:
+        train_ds = Subset(full_ds, [0])  # QA sample is deterministic
 
     train_loader = DataLoader(
         train_ds, batch_size=1, shuffle=False,
