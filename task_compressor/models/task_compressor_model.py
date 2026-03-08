@@ -251,12 +251,14 @@ class TaskCompressorModel(nn.Module):
             [prefix_mask, prompt_mask, response_mask], dim=1
         )
 
-        # Forward through frozen decoder
-        outputs = self.base_model(
-            inputs_embeds=inputs_embeds,
-            attention_mask=attn_mask,
-            return_dict=True,
-        )
+        # Decoder forward in fp32: backward through many transformer layers
+        # loses precision in bf16, causing NaN gradients.
+        with torch.amp.autocast(device_type=device.type, enabled=False):
+            outputs = self.base_model(
+                inputs_embeds=inputs_embeds.float(),
+                attention_mask=attn_mask,
+                return_dict=True,
+            )
         logits = outputs.logits  # (B, total_len, V)
 
         # Build labels: only compute loss on response tokens
@@ -373,11 +375,14 @@ class TaskCompressorModel(nn.Module):
         prefix_mask = torch.ones(B, k + 1, device=device, dtype=segment_mask.dtype)
         attn_mask = torch.cat([prefix_mask, segment_mask], dim=1)
 
-        outputs = self.base_model(
-            inputs_embeds=inputs_embeds,
-            attention_mask=attn_mask,
-            return_dict=True,
-        )
+        # Decoder forward in fp32: backward through many transformer layers
+        # loses precision in bf16, causing NaN gradients.
+        with torch.amp.autocast(device_type=device.type, enabled=False):
+            outputs = self.base_model(
+                inputs_embeds=inputs_embeds.float(),
+                attention_mask=attn_mask,
+                return_dict=True,
+            )
         logits = outputs.logits  # (B, total_len, V)
 
         self._enable_adapter_forward_only()
