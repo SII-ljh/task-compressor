@@ -135,10 +135,18 @@ class Trainer:
                 metrics = self._train_step(batch)
 
                 if (self.global_step + 1) % tc.gradient_accumulation_steps == 0:
-                    torch.nn.utils.clip_grad_norm_(
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
                         self.raw_model.parameters(), tc.max_grad_norm
                     )
-                    self.optimizer.step()
+                    metrics["grad_norm"] = grad_norm.item()
+
+                    if torch.isfinite(grad_norm):
+                        self.optimizer.step()
+                    else:
+                        logger.warning(
+                            f"[Step {self.global_step}] Non-finite grad_norm "
+                            f"({grad_norm:.4f}), skipping optimizer step"
+                        )
                     self.scheduler.step()
                     self.optimizer.zero_grad()
 
@@ -202,7 +210,14 @@ class Trainer:
                     distill_method=tc.distill_method,
                 )
 
-        loss = outputs["loss"] / tc.gradient_accumulation_steps
+        loss = outputs["loss"].float() / tc.gradient_accumulation_steps
+        if not torch.isfinite(loss):
+            logger.warning(
+                f"[Step {self.global_step}] Non-finite loss ({loss.item():.4f}), "
+                "zeroing gradients and skipping backward"
+            )
+            self.optimizer.zero_grad()
+            return {"loss": float("nan")}
         loss.backward()
 
         metrics = {

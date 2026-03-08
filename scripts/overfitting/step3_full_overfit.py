@@ -19,6 +19,10 @@ Usage:
   # Custom data and steps
   python scripts/overfitting/step3_full_overfit.py --stage 1 \
       --data_path ../deep_compressor/data/ntp_tiny.jsonl --steps 5000
+
+  # Aggressive LR (use fp32 to avoid bf16 NaN at high LR)
+  python scripts/overfitting/step3_full_overfit.py --stage 1 --lr 1e-3 --no_bf16
+  python scripts/overfitting/step3_full_overfit.py --stage 2 --lr 1e-3 --no_bf16
 """
 
 import argparse
@@ -111,30 +115,13 @@ def evaluate(model, loader, device, stage, use_bf16=False, distill_alpha=0.0):
 
 # ── Training loop ─────────────────────────────────────────────────────
 
-def _build_optimizer(model, lr, lora_lr):
-    """Build optimizer with differential learning rates (perceiver vs LoRA)."""
-    lora_params = []
-    new_params = []
-    for name, param in model.named_parameters():
-        if not param.requires_grad:
-            continue
-        if "lora" in name.lower():
-            lora_params.append(param)
-        else:
-            new_params.append(param)
-    groups = [
-        {"params": new_params, "lr": lr},
-        {"params": lora_params, "lr": lora_lr},
-    ]
-    logger.info(f"Optimizer: {len(new_params)} new params (lr={lr:.2e}), "
-                f"{len(lora_params)} LoRA params (lr={lora_lr:.2e})")
-    return torch.optim.AdamW(groups, weight_decay=0.0)
-
-
 def train(model, train_loader, val_loader, device, args, use_bf16=False):
     """Training loop with periodic val evaluation."""
 
-    optimizer = _build_optimizer(model, args.lr, args.lora_lr)
+    optimizer = torch.optim.AdamW(
+        [p for p in model.parameters() if p.requires_grad],
+        lr=args.lr, weight_decay=0.0,
+    )
 
     from torch.optim.lr_scheduler import LambdaLR
 
@@ -218,33 +205,41 @@ def train(model, train_loader, val_loader, device, args, use_bf16=False):
                     )
                     task_loss_key = "qa_loss"
 
-            loss = outputs["loss"].float() / args.grad_accum  # fp32 backward for stability
-            if torch.isnan(loss) or torch.isinf(loss):
-                logger.error(f"NaN/Inf loss at step {step+1}, stopping training.")
-                logger.error("Try: lower --lr or --lora_lr, or use --no_bf16")
-                csv_file.close()
-                return float("inf")
+            loss = outputs["loss"].float() / args.grad_accum
+            if not torch.isfinite(loss):
+                logger.warning(f"step {step}: NaN/Inf loss, skipping")
+                optimizer.zero_grad()
+                micro_steps += 1
+                if micro_steps % args.grad_accum == 0:
+                    step += 1
+                    if step >= args.steps:
+                        break
+                continue
             loss.backward()
             running_loss += outputs[task_loss_key].float().item()
             micro_steps += 1
 
             if micro_steps % args.grad_accum == 0:
-                torch.nn.utils.clip_grad_norm_(
+                grad_norm = torch.nn.utils.clip_grad_norm_(
                     [p for p in model.parameters() if p.requires_grad],
-                    1.0)
-                optimizer.step()
+                    args.max_grad_norm)
+                if torch.isfinite(grad_norm):
+                    optimizer.step()
+                else:
+                    logger.warning(f"step {step}: NaN/Inf grad_norm, skipping optimizer step")
                 scheduler.step()
                 optimizer.zero_grad()
                 step += 1
 
                 # Logging
                 if step % args.log_every == 0:
-                    avg = running_loss / micro_steps
+                    avg = running_loss / max(micro_steps, 1)
                     lr = scheduler.get_last_lr()[0]
                     elapsed = time.time() - t0
                     logger.info(
                         f"step {step}/{args.steps}  "
                         f"loss={avg:.4f}  lr={lr:.2e}  "
+                        f"grad_norm={grad_norm:.4f}  "
                         f"elapsed={elapsed:.0f}s  epoch={epoch}"
                     )
                     running_loss = 0.0
@@ -341,10 +336,8 @@ def main():
 
     parser.add_argument("--steps", type=int, default=20000,
                         help="Total training steps (default: 20000)")
-    parser.add_argument("--lr", type=float, default=1e-4,
-                        help="Peak learning rate for perceiver/tokens (default: 1e-4)")
-    parser.add_argument("--lora_lr", type=float, default=None,
-                        help="LoRA learning rate (default: lr/5)")
+    parser.add_argument("--lr", type=float, default=3e-4,
+                        help="Peak learning rate (default: 3e-4)")
     parser.add_argument("--batch_size", type=int, default=4,
                         help="Batch size (default: 4)")
     parser.add_argument("--grad_accum", type=int, default=2,
@@ -364,6 +357,8 @@ def main():
     parser.add_argument("--save_every", type=int, default=5000,
                         help="Save checkpoint every N steps (default: 5000)")
 
+    parser.add_argument("--max_grad_norm", type=float, default=1.0,
+                        help="Max gradient norm for clipping (default: 1.0)")
     parser.add_argument("--no_bf16", action="store_true",
                         help="Disable bf16 mixed precision")
     parser.add_argument("--output_dir", type=str,
@@ -372,10 +367,6 @@ def main():
                         help="Resume from checkpoint (e.g. Stage 1 checkpoint for Stage 2)")
 
     args = parser.parse_args()
-
-    # Default LoRA lr = lr / 5 (matches main trainer's 5:1 ratio)
-    if args.lora_lr is None:
-        args.lora_lr = args.lr / 5
 
     # Distillation only makes sense for stage 2
     if args.stage == 1 and args.distill_alpha > 0:
@@ -426,7 +417,7 @@ def main():
         logger.info(f"GPU: {gpu_name} ({gpu_mem:.0f} GB)")
     logger.info(f"bf16: {'ON' if use_bf16 else 'OFF'}")
     logger.info(f"Data: {args.data_path}")
-    logger.info(f"Steps: {args.steps}  LR: {args.lr}  LoRA_LR: {args.lora_lr}  "
+    logger.info(f"Steps: {args.steps}  LR: {args.lr}  "
                 f"Batch: {args.batch_size}x{args.grad_accum} "
                 f"(effective {args.batch_size * args.grad_accum})")
     if args.stage == 2:
