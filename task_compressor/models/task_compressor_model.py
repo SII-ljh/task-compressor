@@ -252,8 +252,10 @@ class TaskCompressorModel(nn.Module):
         )
 
         # Decoder forward in fp32: backward through many transformer layers
-        # loses precision in bf16, causing NaN gradients.
-        with torch.amp.autocast(device_type=device.type, enabled=False):
+        # loses precision in bf16, causing NaN gradients.  Use autocast with
+        # dtype=float32 (not enabled=False) so Linear layers auto-promote
+        # their bf16 weights to fp32.
+        with torch.amp.autocast(device_type=device.type, dtype=torch.float32):
             outputs = self.base_model(
                 inputs_embeds=inputs_embeds.float(),
                 attention_mask=attn_mask,
@@ -376,8 +378,10 @@ class TaskCompressorModel(nn.Module):
         attn_mask = torch.cat([prefix_mask, segment_mask], dim=1)
 
         # Decoder forward in fp32: backward through many transformer layers
-        # loses precision in bf16, causing NaN gradients.
-        with torch.amp.autocast(device_type=device.type, enabled=False):
+        # loses precision in bf16, causing NaN gradients.  Use autocast with
+        # dtype=float32 (not enabled=False) so Linear layers auto-promote
+        # their bf16 weights to fp32.
+        with torch.amp.autocast(device_type=device.type, dtype=torch.float32):
             outputs = self.base_model(
                 inputs_embeds=inputs_embeds.float(),
                 attention_mask=attn_mask,
