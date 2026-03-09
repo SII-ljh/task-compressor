@@ -237,9 +237,11 @@ def init_wandb(
     if not enabled:
         return None
     try:
+        import os
         import wandb
 
-        kwargs = dict(project=project, name=run_name)
+        os.environ["WANDB_MODE"] = "offline"
+        kwargs = dict(project=project, name=run_name, mode="offline")
         if config is not None:
             kwargs["config"] = config
         if entity is not None:

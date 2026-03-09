@@ -72,16 +72,18 @@ class Trainer:
         # Mixed precision
         self.use_amp = config.training.bf16 and self.device.type == "cuda"
 
-        # wandb
+        # wandb (offline mode — cluster has no internet)
         self._wandb = None
         if self.is_main:
             try:
                 import wandb
 
+                os.environ["WANDB_MODE"] = "offline"
                 wandb.init(
                     project=config.wandb_project,
                     name=config.wandb_run_name,
                     config=config.to_dict(),
+                    mode="offline",
                 )
                 self._wandb = wandb
             except Exception:
