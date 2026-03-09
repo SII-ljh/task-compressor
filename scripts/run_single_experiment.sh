@@ -4,7 +4,7 @@
 # ============================================================
 # Usage:
 #   bash scripts/run_single_experiment.sh k64_baseline
-#   bash scripts/run_single_experiment.sh k128_lowcomp
+#   bash scripts/run_single_experiment.sh k512_low
 #
 # Or directly with torchrun:
 #   torchrun --nproc_per_node=8 scripts/train.py \
@@ -21,11 +21,14 @@ if [ $# -lt 1 ]; then
     echo "Usage: $0 <experiment_name>"
     echo ""
     echo "Available experiments:"
-    echo "  k16_extreme    k=16  (256x compression)  n_p=4,  n_c=12"
-    echo "  k32_high       k=32  (128x compression)  n_p=8,  n_c=24"
-    echo "  k64_baseline   k=64  ( 64x compression)  n_p=16, n_c=48"
-    echo "  k128_moderate  k=128 ( 32x compression)  n_p=32, n_c=96"
-    echo "  k256_low       k=256 ( 16x compression)  n_p=64, n_c=192"
+    echo "  k16_extreme    k=16   (256x compression)  n_p=4,   n_c=12"
+    echo "  k32_high       k=32   (128x compression)  n_p=8,   n_c=24"
+    echo "  k64_baseline   k=64   ( 64x compression)  n_p=16,  n_c=48"
+    echo "  k128_moderate  k=128  ( 32x compression)  n_p=32,  n_c=96"
+    echo "  k256_low       k=256  ( 16x compression)  n_p=64,  n_c=192"
+    echo "  k512_vlow      k=512  (  8x compression)  n_p=128, n_c=384"
+    echo "  k1024_minimal  k=1024 (  4x compression)  n_p=256, n_c=768"
+    echo "  k2048_near     k=2048 (  2x compression)  n_p=512, n_c=1536"
     exit 1
 fi
 
@@ -42,6 +45,12 @@ case ${EXPERIMENT} in
         NP=32; NC=96; K=128 ;;
     k256_low)
         NP=64; NC=192; K=256 ;;
+    k512_vlow)
+        NP=128; NC=384; K=512 ;;
+    k1024_minimal)
+        NP=256; NC=768; K=1024 ;;
+    k2048_near)
+        NP=512; NC=1536; K=2048 ;;
     *)
         echo "Unknown experiment: ${EXPERIMENT}"
         exit 1 ;;

@@ -2,20 +2,23 @@
 # ============================================================
 # Compression Ratio Ablation — 8×H200
 # ============================================================
-# Runs 5 experiments with different soft prompt counts (k):
-#   k=16  (256x compression)  n_p=4,  n_c=12
-#   k=32  (128x compression)  n_p=8,  n_c=24
-#   k=64  ( 64x compression)  n_p=16, n_c=48   ← baseline
-#   k=128 ( 32x compression)  n_p=32, n_c=96
-#   k=256 ( 16x compression)  n_p=64, n_c=192
+# Runs 8 experiments with different soft prompt counts (k):
+#   k=16   (256x compression)  n_p=4,   n_c=12
+#   k=32   (128x compression)  n_p=8,   n_c=24
+#   k=64   ( 64x compression)  n_p=16,  n_c=48    ← baseline
+#   k=128  ( 32x compression)  n_p=32,  n_c=96
+#   k=256  ( 16x compression)  n_p=64,  n_c=192
+#   k=512  (  8x compression)  n_p=128, n_c=384
+#   k=1024 (  4x compression)  n_p=256, n_c=768
+#   k=2048 (  2x compression)  n_p=512, n_c=1536
 #
 # If one experiment fails, it logs the failure and continues
 # with the remaining experiments.
 #
 # Usage:
-#   bash scripts/run_compression_ablation.sh          # run all
-#   bash scripts/run_compression_ablation.sh 64       # run k=64 only
-#   bash scripts/run_compression_ablation.sh 16 32    # run k=16 and k=32
+#   bash scripts/run_compression_ablation.sh              # run all
+#   bash scripts/run_compression_ablation.sh 64           # run k=64 only
+#   bash scripts/run_compression_ablation.sh 16 32 64     # run selected
 # ============================================================
 
 set -uo pipefail
@@ -33,13 +36,16 @@ declare -A EXPERIMENTS=(
     [64]="16 48"
     [128]="32 96"
     [256]="64 192"
+    [512]="128 384"
+    [1024]="256 768"
+    [2048]="512 1536"
 )
 
 # ── Parse CLI args: which k values to run ──
 if [ $# -gt 0 ]; then
     SELECTED_K=("$@")
 else
-    SELECTED_K=(16 32 64 128 256)
+    SELECTED_K=(16 32 64 128 256 512 1024 2048)
 fi
 
 # Track results
@@ -56,7 +62,7 @@ echo "================================================================"
 
 for K in "${SELECTED_K[@]}"; do
     if [ -z "${EXPERIMENTS[$K]+x}" ]; then
-        echo "ERROR: Unknown k=${K}. Valid values: 16, 32, 64, 128, 256"
+        echo "ERROR: Unknown k=${K}. Valid values: 16, 32, 64, 128, 256, 512, 1024, 2048"
         FAILED+=("k=${K} (unknown)")
         continue
     fi
