@@ -104,6 +104,17 @@ class TaskCompressorModel(nn.Module):
             torch.randn(1, hidden_size, dtype=torch_dtype) * 0.02
         )
 
+        # ── 7. Upcast trainable params to fp32 for optimizer stability ──
+        # AdamW stores exp_avg / exp_avg_sq in the parameter's dtype.
+        # With bf16 params these running averages lose precision after
+        # ~300 steps, causing divergent updates → NaN gradients.
+        # Keeping trainable params fp32 gives fp32 optimizer states while
+        # autocast(bf16) still handles the forward pass in bf16.
+        if torch_dtype != torch.float32:
+            for p in self.parameters():
+                if p.requires_grad:
+                    p.data = p.data.float()
+
         # ── Gradient checkpointing ───────────────────────────────────────
         if config.gradient_checkpointing:
             self.base_model.gradient_checkpointing_enable(
