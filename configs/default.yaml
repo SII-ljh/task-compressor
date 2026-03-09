@@ -16,11 +16,11 @@ model:
   gradient_checkpointing: true
 
 training:
-  per_gpu_batch_size: 2
-  gradient_accumulation_steps: 8
-  # effective batch_size = per_gpu * num_gpus * grad_accum
+  per_gpu_batch_size: 32
+  gradient_accumulation_steps: 4
+  # effective batch_size = per_gpu * grad_accum = 128 (single GPU)
   warmup_steps: 500
-  total_steps: 50000
+  total_steps: 40000          # ~10.6 epochs over 483K samples @ batch 128
   lora_lr: 1.0e-5
   perceiver_lr: 5.0e-5
   max_grad_norm: 5.0

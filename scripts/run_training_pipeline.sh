@@ -245,7 +245,7 @@ with open('${STEP1_OUTPUT}/learning_curve.csv') as f:
             --steps 2000 \
             --lr 3e-4 \
             --lora_lr 3e-5 \
-            --batch_size 4 \
+            --batch_size 32 \
             --log_every 20 \
             --output_dir "${STEP2_OUTPUT}" \
     || {
