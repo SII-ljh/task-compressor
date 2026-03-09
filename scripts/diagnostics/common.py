@@ -2,8 +2,6 @@
 
 Provides device detection, tensor statistics, model building, data preparation,
 wandb helpers, and CLI argument parsing shared by pre/mid/post training scripts.
-
-Supports both Stage 1 (NTP) and Stage 2 (QA) modes.
 """
 
 from __future__ import annotations
@@ -23,7 +21,7 @@ from transformers import AutoTokenizer
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from task_compressor.config import Config, ModelConfig
-from task_compressor.data import NTPCollator, NTPDataset, QACollator, QADataset
+from task_compressor.data import QACollator, QADataset
 from task_compressor.models import TaskCompressorModel
 
 
@@ -177,41 +175,6 @@ def prepare_qa_batch(
     return batch, tokenizer
 
 
-def prepare_ntp_batch(
-    config: Config,
-    data_path: str,
-    batch_size: int,
-    device: torch.device,
-    tokenizer_name: Optional[str] = None,
-) -> Tuple[dict, AutoTokenizer]:
-    """Load a single NTP batch and tokenizer for diagnostic use.
-
-    Returns:
-        (batch_on_device, tokenizer)
-    """
-    model_name = tokenizer_name or config.model.base_model
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    ds = NTPDataset(
-        data_path,
-        tokenizer,
-        max_context_length=config.data.max_context_length,
-        ntp_segment_len=config.data.ntp_segment_len,
-    )
-    collator = NTPCollator(pad_token_id=tokenizer.pad_token_id)
-
-    n = min(batch_size, len(ds))
-    subset = Subset(ds, list(range(n)))
-
-    batch = next(
-        iter(DataLoader(subset, batch_size=n, shuffle=False, collate_fn=collator))
-    )
-    batch = to_device(batch, device)
-    return batch, tokenizer
-
-
 def prepare_qa_loader(
     config: Config,
     data_path: str,
@@ -244,55 +207,16 @@ def prepare_qa_loader(
     return loader, tokenizer
 
 
-def prepare_ntp_loader(
-    config: Config,
-    data_path: str,
-    batch_size: int,
-    max_samples: int = 0,
-    tokenizer_name: Optional[str] = None,
-) -> Tuple[DataLoader, AutoTokenizer]:
-    """Build an NTP DataLoader for evaluation diagnostics.
-
-    Returns:
-        (data_loader, tokenizer)
-    """
-    model_name = tokenizer_name or config.model.base_model
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    ds = NTPDataset(
-        data_path,
-        tokenizer,
-        max_context_length=config.data.max_context_length,
-        ntp_segment_len=config.data.ntp_segment_len,
-    )
-    if max_samples > 0 and max_samples < len(ds):
-        ds = Subset(ds, list(range(max_samples)))
-
-    collator = NTPCollator(pad_token_id=tokenizer.pad_token_id)
-    loader = DataLoader(ds, batch_size=batch_size, shuffle=False, collate_fn=collator)
-    return loader, tokenizer
-
-
-def auto_detect_data_path(stage: int) -> Optional[str]:
-    """Auto-detect data path based on training stage."""
-    if stage == 1:
-        candidates = [
-            "data/ntp_tiny.jsonl",
-            "data/ntp_train.jsonl",
-            "../deep_compressor/data/ntp_tiny.jsonl",
-            "../deep_compressor/data/ntp_train.jsonl",
-        ]
-    else:
-        candidates = [
-            "data/qa_tiny_train.json",
-            "data/qa_dev.json",
-            "data/qa_train.json",
-            "../deep_compressor/data/qa_tiny_train.json",
-            "../deep_compressor/data/qa_dev.json",
-            "../deep_compressor/data/qa_train.json",
-        ]
+def auto_detect_data_path() -> Optional[str]:
+    """Auto-detect QA data path."""
+    candidates = [
+        "data/qa_tiny_train.json",
+        "data/qa_dev.json",
+        "data/qa_train.json",
+        "../deep_compressor/data/qa_tiny_train.json",
+        "../deep_compressor/data/qa_dev.json",
+        "../deep_compressor/data/qa_train.json",
+    ]
     for p in candidates:
         if os.path.exists(p):
             return p
@@ -350,10 +274,8 @@ def base_parser(description: str) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument("--config", default="configs/default.yaml",
                         help="Path to YAML config file")
-    parser.add_argument("--stage", type=int, default=1, choices=[1, 2],
-                        help="Training stage: 1=NTP, 2=QA (default: 1)")
     parser.add_argument("--data_path", default=None,
-                        help="Path to data file (auto-detected based on stage if not set)")
+                        help="Path to data file (auto-detected if not set)")
     parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--no_bf16", action="store_true",
                         help="Disable bf16 mixed precision")

@@ -1,11 +1,8 @@
 """Trainer for Task Compressor.
 
-Two-stage training with differential learning rates:
+Single-stage QA training with differential learning rates:
   - Perceiver / PromptEncoder / separator: perceiver_lr (5e-5)
   - LoRA adapters: lora_lr (1e-5)
-
-Stage 1 (NTP):  compress doc → soft prompts → predict continuation (CE only)
-Stage 2 (QA):   compress doc → soft prompts → answer question (CE + distillation)
 
 Supports DDP and optional DeepSpeed ZeRO-2.
 """
@@ -20,7 +17,7 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.data import DataLoader, DistributedSampler, Subset
 
 from .config import Config
 
@@ -36,13 +33,17 @@ class Trainer:
         config: Config,
         train_loader: DataLoader,
         dev_loader: DataLoader | None = None,
-        mode: str = "qa",
+        tokenizer=None,
     ):
         self.config = config
-        self.mode = mode  # "qa" or "ntp"
         self.train_loader = train_loader
         self.dev_loader = dev_loader
+        self.tokenizer = tokenizer
         self.global_step = 0
+
+        # Running loss accumulator for smoothed logging
+        self._running_loss = 0.0
+        self._running_count = 0
 
         # Distributed setup
         self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -183,32 +184,14 @@ class Trainer:
             dtype=torch.bfloat16,
             enabled=self.use_amp,
         ):
-            if self.mode == "ntp":
-                outputs = self.model(
-                    mode="ntp",
-                    doc_ids=batch["doc_ids"],
-                    doc_mask=batch["doc_mask"],
-                    segment_ids=batch["segment_ids"],
-                    segment_mask=batch["segment_mask"],
-                    segment_labels=batch["segment_labels"],
-                )
-            else:
-                outputs = self.model(
-                    mode="qa",
-                    context_ids=batch["context_ids"],
-                    context_mask=batch["context_mask"],
-                    prompt_ids=batch["prompt_ids"],
-                    prompt_mask=batch["prompt_mask"],
-                    response_ids=batch["response_ids"],
-                    response_mask=batch["response_mask"],
-                    teacher_input_ids=batch["teacher_input_ids"],
-                    teacher_attention_mask=batch["teacher_attention_mask"],
-                    response_starts=batch["response_starts"],
-                    response_lens=batch["response_lens"],
-                    distill_alpha=tc.distill_alpha,
-                    distill_temperature=tc.distill_temperature,
-                    distill_method=tc.distill_method,
-                )
+            outputs = self.model(
+                context_ids=batch["context_ids"],
+                context_mask=batch["context_mask"],
+                prompt_ids=batch["prompt_ids"],
+                prompt_mask=batch["prompt_mask"],
+                response_ids=batch["response_ids"],
+                response_mask=batch["response_mask"],
+            )
 
         loss = outputs["loss"].float() / tc.gradient_accumulation_steps
         if not torch.isfinite(loss):
@@ -221,73 +204,172 @@ class Trainer:
             return {"loss": float("nan")}
         loss.backward()
 
+        # Accumulate running loss for smoothed logging
+        cur_loss = outputs["qa_loss"].item()
+        self._running_loss += cur_loss
+        self._running_count += 1
+
         metrics = {
-            "loss": outputs["loss"].item(),
+            "loss": cur_loss,
+            "qa_loss": cur_loss,
             "lr_perceiver": self.optimizer.param_groups[0]["lr"],
             "lr_lora": self.optimizer.param_groups[1]["lr"],
         }
-        if self.mode == "ntp":
-            metrics["ntp_loss"] = outputs["ntp_loss"].item()
-        else:
-            metrics["qa_loss"] = outputs["qa_loss"].item()
-            metrics["distill_loss"] = outputs["distill_loss"].item()
         return metrics
 
     @torch.no_grad()
     def _evaluate(self):
         if self.dev_loader is None:
             return
+        tc = self.config.training
         self.model.eval()
         total_loss = 0.0
-        n = 0
+        n_batches = 0
+        n_samples = 0
+        max_eval = tc.max_eval_samples
+        sample_batch = None
 
         for batch in self.dev_loader:
-            batch = {k: v.to(self.device) for k, v in batch.items()}
-            with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=self.use_amp):
-                if self.mode == "ntp":
-                    outputs = self.model(
-                        mode="ntp",
-                        doc_ids=batch["doc_ids"],
-                        doc_mask=batch["doc_mask"],
-                        segment_ids=batch["segment_ids"],
-                        segment_mask=batch["segment_mask"],
-                        segment_labels=batch["segment_labels"],
-                    )
-                else:
-                    outputs = self.model(
-                        mode="qa",
-                        context_ids=batch["context_ids"],
-                        context_mask=batch["context_mask"],
-                        prompt_ids=batch["prompt_ids"],
-                        prompt_mask=batch["prompt_mask"],
-                        response_ids=batch["response_ids"],
-                        response_mask=batch["response_mask"],
-                        distill_alpha=0.0,
-                    )
-            total_loss += outputs["loss"].item()
-            n += 1
+            batch_on_device = {k: v.to(self.device) for k, v in batch.items()}
+            bs = batch["context_ids"].shape[0]
 
-        avg_loss = total_loss / max(n, 1)
-        metrics: dict = {
-            "eval/loss": avg_loss,
-            "step": self.global_step,
-        }
-        if self.mode == "ntp":
-            metrics["eval/perplexity"] = math.exp(min(avg_loss, 20))
+            # Stop if we've evaluated enough samples
+            if max_eval > 0 and n_samples >= max_eval:
+                break
+
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=self.use_amp):
+                outputs = self.model(
+                    context_ids=batch_on_device["context_ids"],
+                    context_mask=batch_on_device["context_mask"],
+                    prompt_ids=batch_on_device["prompt_ids"],
+                    prompt_mask=batch_on_device["prompt_mask"],
+                    response_ids=batch_on_device["response_ids"],
+                    response_mask=batch_on_device["response_mask"],
+                )
+            total_loss += outputs["qa_loss"].float().item() * bs
+            n_batches += 1
+            n_samples += bs
+
+            # Save first batch for sample predictions
+            if sample_batch is None:
+                sample_batch = batch_on_device
+
+        avg_loss = total_loss / max(n_samples, 1)
+        ppl = math.exp(min(avg_loss, 20.0))
+
         if self.is_main:
-            logger.info(f"[Eval step={self.global_step}] {metrics}")
+            logger.info(
+                f"[Eval] step {self.global_step}/{tc.total_steps}  "
+                f"eval_loss={avg_loss:.4f}  eval_ppl={ppl:.2f}  "
+                f"samples={n_samples}"
+            )
+            metrics = {
+                "eval/loss": avg_loss,
+                "eval/ppl": ppl,
+                "eval/samples": n_samples,
+                "step": self.global_step,
+            }
             if self._wandb:
                 self._wandb.log(metrics, step=self.global_step)
 
+            # Sample predictions
+            if sample_batch is not None and tc.num_sample_predictions > 0:
+                self._log_sample_predictions(sample_batch, tc.num_sample_predictions)
+
+    def _log_sample_predictions(self, batch: dict, num_samples: int):
+        """Generate and log sample predictions from a batch."""
+        raw = self.raw_model
+        raw.eval()
+
+        bs = batch["context_ids"].shape[0]
+        num_samples = min(num_samples, bs)
+
+        # Slice batch to num_samples
+        sample = {k: v[:num_samples] for k, v in batch.items()}
+
+        try:
+            # Encode → compress → generate
+            encoder_hidden = raw.encode(sample["context_ids"], sample["context_mask"])
+            compressed = raw.compress(
+                encoder_hidden, sample["context_mask"],
+                sample["prompt_ids"], sample["prompt_mask"],
+            )
+            eos_id = self.tokenizer.eos_token_id if self.tokenizer else None
+            generated_ids = raw.generate(
+                compressed,
+                sample["prompt_ids"], sample["prompt_mask"],
+                max_new_tokens=128,
+                temperature=0.0,  # greedy for deterministic samples
+                eos_token_id=eos_id,
+            )
+
+            logger.info("── Sample Predictions ──")
+            for i in range(num_samples):
+                # Decode prompt
+                prompt_ids_i = sample["prompt_ids"][i]
+                prompt_mask_i = sample["prompt_mask"][i]
+                prompt_len = prompt_mask_i.sum().item()
+                prompt_text = self._decode(prompt_ids_i[:int(prompt_len)])
+
+                # Decode ground truth response
+                resp_ids_i = sample["response_ids"][i]
+                resp_mask_i = sample["response_mask"][i]
+                resp_len = resp_mask_i.sum().item()
+                ref_text = self._decode(resp_ids_i[:int(resp_len)])
+
+                # Decode prediction
+                pred_text = self._decode(generated_ids[i])
+
+                logger.info(f"  [{i+1}] Prompt:     {prompt_text[:200]}")
+                logger.info(f"      Reference:  {ref_text[:200]}")
+                logger.info(f"      Predicted:  {pred_text[:200]}")
+            logger.info("────────────────────────")
+
+        except Exception as e:
+            logger.warning(f"Sample prediction failed: {e}")
+
+    def _decode(self, token_ids: torch.Tensor) -> str:
+        """Decode token ids to string."""
+        if self.tokenizer is None:
+            return str(token_ids.tolist())
+        return self.tokenizer.decode(token_ids, skip_special_tokens=True)
+
     def _log(self, metrics: dict):
-        metrics["step"] = self.global_step
-        logger.info(f"[Step {self.global_step}] {metrics}")
+        tc = self.config.training
+
+        # Use running average for smoothed loss
+        if self._running_count > 0:
+            avg_loss = self._running_loss / self._running_count
+        else:
+            avg_loss = metrics.get("loss", 0.0)
+
+        ppl = math.exp(min(avg_loss, 20.0))
+        lr = metrics.get("lr_perceiver", 0.0)
+        grad_norm = metrics.get("grad_norm", 0.0)
+
+        logger.info(
+            f"step {self.global_step}/{tc.total_steps}  "
+            f"loss={avg_loss:.4f}  ppl={ppl:.2f}  "
+            f"lr={lr:.2e}  grad_norm={grad_norm:.4f}"
+        )
+
+        wandb_metrics = {
+            "train/loss": avg_loss,
+            "train/ppl": ppl,
+            "train/lr_perceiver": metrics.get("lr_perceiver", 0.0),
+            "train/lr_lora": metrics.get("lr_lora", 0.0),
+            "train/grad_norm": grad_norm,
+            "step": self.global_step,
+        }
         if self._wandb:
-            self._wandb.log(metrics, step=self.global_step)
+            self._wandb.log(wandb_metrics, step=self.global_step)
+
+        # Reset running accumulator
+        self._running_loss = 0.0
+        self._running_count = 0
 
     def _save_nan_diagnostics(self, batch: dict, outputs: dict):
         """Save detailed diagnostics when NaN is detected."""
-        import pickle
         from pathlib import Path
 
         debug_dir = Path(self.config.output_dir) / "nan_debug"
@@ -297,7 +379,6 @@ class Trainer:
         # Collect diagnostic info
         diagnostics = {
             "global_step": self.global_step,
-            "mode": self.mode,
             "lr_perceiver": self.optimizer.param_groups[0]["lr"],
             "lr_lora": self.optimizer.param_groups[1]["lr"],
             "batch": {k: v.cpu() for k, v in batch.items()},

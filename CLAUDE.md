@@ -107,13 +107,13 @@ task_compressor/
 │   └── default.yaml              # Default hyperparameters
 ├── scripts/
 │   ├── download_models.py        # Qwen3 model downloader
-│   ├── prepare_data.py           # NTP + QA dataset preparation
+│   ├── prepare_data.py           # QA dataset preparation
 │   ├── train.py                  # Training entry point
 │   └── evaluate.py               # Evaluation & benchmarking
 ├── task_compressor/              # Python package
 │   ├── __init__.py
 │   ├── config.py                 # Dataclass configs with YAML loading
-│   ├── losses.py                 # L_QA (CE) + L_distill (KL/MSE)
+│   ├── losses.py                 # L_QA (CE loss)
 │   ├── data.py                   # QADataset + QACollator
 │   ├── trainer.py                # Training loop (DDP, wandb, checkpointing)
 │   ├── inference.py              # EncoderCacheManager + Pipeline
@@ -149,4 +149,3 @@ task_compressor/
 1. **Single Qwen instance**: encoder/decoder share weights, LoRA toggled via peft enable/disable
 2. **Single-stage training**: LoRA init delta≈0, Perceiver starts with high-quality Qwen hidden states
 3. **Differential LR**: Perceiver/PromptEncoder 5e-5, LoRA 1e-5
-4. **Distillation**: KL(teacher‖student) with T=2.0, teacher = frozen Qwen on full context

@@ -25,16 +25,14 @@ training:
   perceiver_lr: 5.0e-5
   max_grad_norm: 5.0
   weight_decay: 0.01
-  distill_alpha: 0.5
-  distill_temperature: 2.0
-  distill_method: "kl"       # "kl" or "mse"
   bf16: true
   deepspeed: null             # path to deepspeed config, null = DDP
   save_steps: 1000
   eval_steps: 500
   logging_steps: 10
-  stage: 1                           # 1=NTP pretraining, 2=QA fine-tuning
-  resume_from: null                  # checkpoint path for stage 2
+  max_eval_samples: 5000      # cap eval to N samples (0 = all)
+  num_sample_predictions: 3   # generate N sample predictions during eval
+  resume_from: null           # checkpoint path to resume training
 
 data:
   max_context_length: 4096
@@ -43,8 +41,6 @@ data:
   train_file: "data/qa_train.json"
   dev_file: "data/qa_dev.json"
   num_workers: 4
-  ntp_train_file: "data/ntp_train.jsonl"
-  ntp_segment_len: 256
 
 output_dir: "outputs"
 wandb_project: "task-compressor"

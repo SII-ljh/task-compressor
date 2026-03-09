@@ -3,22 +3,14 @@
 
 Train Task Compressor on N samples (default: 32) as one batch.
 No val split — pure memorization. Goal: loss drops hard, PPL → 1.
-Supports both Stage 1 (NTP) and Stage 2 (QA) modes.
 
 Usage:
-  # Stage 1 (NTP) — default
-  python scripts/overfitting/step2_memorize_tiny.py --stage 1
+  python scripts/overfitting/step2_memorize_tiny.py
+  python scripts/overfitting/step2_memorize_tiny.py --steps 3000 --lr 5e-4
+  python scripts/overfitting/step2_memorize_tiny.py --num_samples 16 --batch_size 16
 
-  # Stage 2 (QA)
-  python scripts/overfitting/step2_memorize_tiny.py --stage 2
-
-  # Custom settings
-  python scripts/overfitting/step2_memorize_tiny.py --stage 1 --steps 3000 --lr 5e-4
-  python scripts/overfitting/step2_memorize_tiny.py --stage 2 --num_samples 16 --batch_size 16
-
-  # Aggressive LR (use fp32 to avoid bf16 NaN at high LR)
-  python scripts/overfitting/step2_memorize_tiny.py --stage 1 --lr 1e-3 --no_bf16
-  python scripts/overfitting/step2_memorize_tiny.py --stage 2 --lr 1e-3 --no_bf16
+  # Use fp32 to avoid bf16 NaN at high LR
+  python scripts/overfitting/step2_memorize_tiny.py --lr 1e-3 --no_bf16
 """
 
 import argparse
@@ -38,7 +30,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from task_compressor.config import Config
-from task_compressor.data import NTPCollator, NTPDataset, QACollator, QADataset
+from task_compressor.data import QACollator, QADataset
 from task_compressor.models import TaskCompressorModel
 
 logging.basicConfig(
@@ -52,7 +44,7 @@ logger = logging.getLogger("step2_memorize_tiny")
 # ── Evaluation ────────────────────────────────────────────────────────
 
 @torch.no_grad()
-def evaluate(model, loader, device, stage, use_bf16=False):
+def evaluate(model, loader, device, use_bf16=False):
     """Compute average loss and perplexity."""
     model.eval()
     total_loss = 0.0
@@ -62,30 +54,16 @@ def evaluate(model, loader, device, stage, use_bf16=False):
         batch_dev = {k: v.to(device) if isinstance(v, torch.Tensor) else v
                      for k, v in batch.items()}
         with autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
-            if stage == 1:
-                outputs = model(
-                    mode="ntp",
-                    doc_ids=batch_dev["doc_ids"],
-                    doc_mask=batch_dev["doc_mask"],
-                    segment_ids=batch_dev["segment_ids"],
-                    segment_mask=batch_dev["segment_mask"],
-                    segment_labels=batch_dev["segment_labels"],
-                )
-                loss_key = "ntp_loss"
-            else:
-                outputs = model(
-                    mode="qa",
-                    context_ids=batch_dev["context_ids"],
-                    context_mask=batch_dev["context_mask"],
-                    prompt_ids=batch_dev["prompt_ids"],
-                    prompt_mask=batch_dev["prompt_mask"],
-                    response_ids=batch_dev["response_ids"],
-                    response_mask=batch_dev["response_mask"],
-                    distill_alpha=0.0,
-                )
-                loss_key = "qa_loss"
+            outputs = model(
+                context_ids=batch_dev["context_ids"],
+                context_mask=batch_dev["context_mask"],
+                prompt_ids=batch_dev["prompt_ids"],
+                prompt_mask=batch_dev["prompt_mask"],
+                response_ids=batch_dev["response_ids"],
+                response_mask=batch_dev["response_mask"],
+            )
         bs = next(v for v in batch_dev.values() if isinstance(v, torch.Tensor)).shape[0]
-        total_loss += outputs[loss_key].float().item() * bs
+        total_loss += outputs["qa_loss"].float().item() * bs
         total_samples += bs
 
     avg_loss = total_loss / max(total_samples, 1)
@@ -159,7 +137,7 @@ def train(model, train_loader, device, args, use_bf16=False):
         logger.info("Using bf16 mixed precision (autocast)")
 
     # Initial eval
-    metrics = evaluate(model, train_loader, device, args.stage, use_bf16=use_bf16)
+    metrics = evaluate(model, train_loader, device, use_bf16=use_bf16)
     logger.info(f"[init] train_loss={metrics['loss']:.4f}  train_ppl={metrics['perplexity']:.1f}")
     csv_writer.writerow([0, f"{metrics['loss']:.4f}", f"{metrics['perplexity']:.1f}",
                          f"{args.lr:.2e}", "0"])
@@ -174,28 +152,14 @@ def train(model, train_loader, device, args, use_bf16=False):
                          for k, v in batch.items()}
 
             with autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
-                if args.stage == 1:
-                    outputs = model(
-                        mode="ntp",
-                        doc_ids=batch_dev["doc_ids"],
-                        doc_mask=batch_dev["doc_mask"],
-                        segment_ids=batch_dev["segment_ids"],
-                        segment_mask=batch_dev["segment_mask"],
-                        segment_labels=batch_dev["segment_labels"],
-                    )
-                    loss_key = "ntp_loss"
-                else:
-                    outputs = model(
-                        mode="qa",
-                        context_ids=batch_dev["context_ids"],
-                        context_mask=batch_dev["context_mask"],
-                        prompt_ids=batch_dev["prompt_ids"],
-                        prompt_mask=batch_dev["prompt_mask"],
-                        response_ids=batch_dev["response_ids"],
-                        response_mask=batch_dev["response_mask"],
-                        distill_alpha=0.0,
-                    )
-                    loss_key = "qa_loss"
+                outputs = model(
+                    context_ids=batch_dev["context_ids"],
+                    context_mask=batch_dev["context_mask"],
+                    prompt_ids=batch_dev["prompt_ids"],
+                    prompt_mask=batch_dev["prompt_mask"],
+                    response_ids=batch_dev["response_ids"],
+                    response_mask=batch_dev["response_mask"],
+                )
 
             loss = outputs["loss"].float() / args.grad_accum
             if not torch.isfinite(loss):
@@ -208,7 +172,7 @@ def train(model, train_loader, device, args, use_bf16=False):
                         break
                 continue
             loss.backward()
-            running_loss += outputs[loss_key].float().item()
+            running_loss += outputs["qa_loss"].float().item()
             micro_steps += 1
 
             if micro_steps % args.grad_accum == 0:
@@ -256,7 +220,7 @@ def train(model, train_loader, device, args, use_bf16=False):
                     break
 
     # Final eval
-    metrics = evaluate(model, train_loader, device, args.stage, use_bf16=use_bf16)
+    metrics = evaluate(model, train_loader, device, use_bf16=use_bf16)
     elapsed = time.time() - t0
     logger.info(
         f"[FINAL] train_loss={metrics['loss']:.4f}  "
@@ -292,10 +256,8 @@ def main():
 
     parser.add_argument("--config", type=str, default="configs/default.yaml",
                         help="Path to YAML config file")
-    parser.add_argument("--stage", type=int, default=1, choices=[1, 2],
-                        help="Training stage: 1=NTP, 2=QA (default: 1)")
     parser.add_argument("--data_path", type=str, default=None,
-                        help="Data path (default: auto-detect based on stage)")
+                        help="Data path (default: auto-detect)")
     parser.add_argument("--num_samples", type=int, default=32,
                         help="Number of samples to use (default: 32)")
 
@@ -328,24 +290,16 @@ def main():
 
     args = parser.parse_args()
 
-    # Auto-detect data path based on stage
+    # Auto-detect data path
     if args.data_path is None:
-        if args.stage == 1:
-            candidates = [
-                "data/ntp_tiny.jsonl",
-                "data/ntp_train.jsonl",
-                "../deep_compressor/data/ntp_tiny.jsonl",
-                "../deep_compressor/data/ntp_train.jsonl",
-            ]
-        else:
-            candidates = [
-                "data/qa_tiny_train.json",
-                "data/qa_dev.json",
-                "data/qa_train.json",
-                "../deep_compressor/data/qa_tiny_train.json",
-                "../deep_compressor/data/qa_dev.json",
-                "../deep_compressor/data/qa_train.json",
-            ]
+        candidates = [
+            "data/qa_tiny_train.json",
+            "data/qa_dev.json",
+            "data/qa_train.json",
+            "../deep_compressor/data/qa_tiny_train.json",
+            "../deep_compressor/data/qa_dev.json",
+            "../deep_compressor/data/qa_train.json",
+        ]
         for p in candidates:
             if os.path.exists(p):
                 args.data_path = p
@@ -363,8 +317,6 @@ def main():
     use_bf16 = (device.type == "cuda" and not args.no_bf16
                 and torch.cuda.is_bf16_supported())
 
-    mode_str = "NTP (Stage 1)" if args.stage == 1 else "QA (Stage 2)"
-    logger.info(f"Mode: {mode_str}")
     logger.info(f"Device: {device}")
     if device.type == "cuda":
         gpu_name = torch.cuda.get_device_name(0)
@@ -387,21 +339,13 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
 
     # Dataset: first N samples
-    if args.stage == 1:
-        full_ds = NTPDataset(
-            args.data_path, tokenizer,
-            max_context_length=config.data.max_context_length,
-            ntp_segment_len=config.data.ntp_segment_len,
-        )
-        collator = NTPCollator(pad_token_id=tokenizer.pad_token_id)
-    else:
-        full_ds = QADataset(
-            args.data_path, tokenizer,
-            max_context_length=config.data.max_context_length,
-            max_prompt_length=config.data.max_prompt_length,
-            max_response_length=config.data.max_response_length,
-        )
-        collator = QACollator(pad_token_id=tokenizer.pad_token_id)
+    full_ds = QADataset(
+        args.data_path, tokenizer,
+        max_context_length=config.data.max_context_length,
+        max_prompt_length=config.data.max_prompt_length,
+        max_response_length=config.data.max_response_length,
+    )
+    collator = QACollator(pad_token_id=tokenizer.pad_token_id)
 
     n_use = min(args.num_samples, len(full_ds))
     train_ds = Subset(full_ds, list(range(n_use)))
@@ -430,7 +374,7 @@ def main():
 
     # Summary
     print("\n" + "=" * 60)
-    print(f"  STEP 2: MEMORIZE {n_use} SAMPLES ({mode_str})")
+    print(f"  STEP 2: MEMORIZE {n_use} SAMPLES (QA)")
     print("=" * 60)
     print(f"  Device:       {device} {'(bf16)' if use_bf16 else '(fp32)'}")
     print(f"  Trainable:    {trainable:,} params")

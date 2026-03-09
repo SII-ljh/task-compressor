@@ -39,16 +39,14 @@ class TrainingConfig:
     perceiver_lr: float = 5e-5
     max_grad_norm: float = 2.0
     weight_decay: float = 0.01
-    distill_alpha: float = 0.5
-    distill_temperature: float = 2.0
-    distill_method: str = "kl"
     bf16: bool = True
     deepspeed: Optional[str] = None
     save_steps: int = 1000
     eval_steps: int = 500
     logging_steps: int = 10
-    stage: int = 1                     # 1=NTP pretraining, 2=QA fine-tuning
-    resume_from: Optional[str] = None  # checkpoint path for stage 2
+    max_eval_samples: int = 5000
+    num_sample_predictions: int = 3
+    resume_from: Optional[str] = None  # checkpoint path to resume training
 
 
 @dataclass
@@ -59,8 +57,6 @@ class DataConfig:
     train_file: str = "data/qa_train.json"
     dev_file: str = "data/qa_dev.json"
     num_workers: int = 4
-    ntp_train_file: str = "data/ntp_train.jsonl"
-    ntp_segment_len: int = 256
 
 
 @dataclass
@@ -106,7 +102,7 @@ class Config:
             val = getattr(self.model, attr)
             if val and not os.path.isabs(val) and os.path.isdir(val):
                 setattr(self.model, attr, os.path.abspath(val))
-        for attr in ("train_file", "dev_file", "ntp_train_file"):
+        for attr in ("train_file", "dev_file"):
             val = getattr(self.data, attr)
             if val and not os.path.isabs(val) and os.path.exists(val):
                 setattr(self.data, attr, os.path.abspath(val))

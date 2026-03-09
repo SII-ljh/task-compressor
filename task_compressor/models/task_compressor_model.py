@@ -298,151 +298,7 @@ class TaskCompressorModel(nn.Module):
             "prefix_len": prefix_len,
         }
 
-    def teacher_forward(
-        self,
-        teacher_input_ids: torch.Tensor,
-        teacher_attention_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        """Frozen teacher forward (LoRA disabled, no gradients).
-
-        Args:
-            teacher_input_ids:      (B, L_total) — concat of context + prompt + response
-            teacher_attention_mask: (B, L_total)
-        Returns:
-            (B, L_total, V) teacher logits.
-        """
-        gc_was_on = self._pause_gradient_checkpointing()
-        self._disable_adapter_forward_only()
-        with torch.no_grad():
-            outputs = self.base_model(
-                input_ids=teacher_input_ids,
-                attention_mask=teacher_attention_mask,
-                return_dict=True,
-            )
-        self._enable_adapter_forward_only()
-        self._resume_gradient_checkpointing(gc_was_on)
-        return outputs.logits
-
-    def compress_ntp(
-        self,
-        encoder_hidden: torch.Tensor,
-        encoder_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        """Compress encoder hidden states *without* prompt conditioning (NTP).
-
-        Uses ``prompt_encoder.latent_tokens`` directly (skip cross-attention)
-        concatenated with ``context_tokens`` as the query for the Perceiver.
-
-        Returns:
-            (B, k, D) compressed soft prompts where k = n_p + n_c.
-        """
-        B = encoder_hidden.shape[0]
-
-        # Base latent tokens (no cross-attention over prompt)
-        prompt_latents = self.prompt_encoder.latent_tokens.unsqueeze(0).expand(B, -1, -1)
-
-        # Learnable context tokens
-        ctx_tokens = self.context_tokens.unsqueeze(0).expand(B, -1, -1)
-
-        # Concatenate query: (B, k, D)
-        query = torch.cat([prompt_latents, ctx_tokens], dim=1)
-
-        return self.perceiver(query, encoder_hidden, encoder_mask)
-
-    def forward_ntp(
-        self,
-        doc_ids: torch.Tensor,
-        doc_mask: torch.Tensor,
-        segment_ids: torch.Tensor,
-        segment_mask: torch.Tensor,
-        segment_labels: torch.Tensor,
-    ) -> dict:
-        """NTP forward pass — compress document, predict continuation segment.
-
-        Sequence: [compressed | sep | segment]
-        Labels: -100 for compressed+sep, segment_labels for segment positions.
-
-        Returns dict with ``loss``, ``ntp_loss``, ``distill_loss`` (always 0).
-        """
-        device = doc_ids.device
-
-        # 1. Encode document (LoRA on)
-        encoder_hidden = self.encode(doc_ids, doc_mask)
-
-        # 2. Compress without prompt conditioning
-        compressed = self.compress_ntp(encoder_hidden, doc_mask)
-
-        # 3. Decode: build [compressed | sep | segment]
-        gc_was_on = self._pause_gradient_checkpointing()
-        self._disable_adapter_forward_only()
-
-        B = compressed.shape[0]
-        k = compressed.shape[1]
-
-        embed_layer = self.get_embedding_layer()
-        segment_embeds = embed_layer(segment_ids)  # (B, L_s, D)
-        sep = self.separator.unsqueeze(0).expand(B, -1, -1)  # (B, 1, D)
-
-        inputs_embeds = torch.cat([compressed, sep, segment_embeds], dim=1)
-
-        prefix_mask = torch.ones(B, k + 1, device=device, dtype=segment_mask.dtype)
-        attn_mask = torch.cat([prefix_mask, segment_mask], dim=1)
-
-        # Decoder forward in fp32: backward through many transformer layers
-        # loses precision in bf16, causing NaN gradients.  Use autocast with
-        # dtype=float32 (not enabled=False) so Linear layers auto-promote
-        # their bf16 weights to fp32.
-        with torch.amp.autocast(device_type=device.type, dtype=torch.float32):
-            outputs = self.base_model(
-                inputs_embeds=inputs_embeds.float(),
-                attention_mask=attn_mask,
-                return_dict=True,
-            )
-        logits = outputs.logits  # (B, total_len, V)
-
-        self._enable_adapter_forward_only()
-        self._resume_gradient_checkpointing(gc_was_on)
-
-        # 4. Build labels: only segment positions
-        L_s = segment_ids.shape[1]
-        prefix_len = k + 1
-        total_len = inputs_embeds.shape[1]
-
-        labels = torch.full(
-            (B, total_len), -100, dtype=torch.long, device=device
-        )
-        labels[:, prefix_len: prefix_len + L_s] = segment_labels
-        # Mask padding in segment
-        pad_positions = segment_mask == 0
-        labels[:, prefix_len: prefix_len + L_s][pad_positions] = -100
-
-        # 5. CE loss (shift-by-one, fp32 for numerical safety)
-        shift_logits = logits[:, :-1, :].contiguous().float()
-        shift_labels = labels[:, 1:].contiguous()
-        ntp_loss = F.cross_entropy(
-            shift_logits.view(-1, shift_logits.shape[-1]),
-            shift_labels.view(-1),
-            ignore_index=-100,
-        )
-
-        return {
-            "loss": ntp_loss,
-            "ntp_loss": ntp_loss,
-            "distill_loss": torch.tensor(0.0, device=device),
-        }
-
-    def forward(self, *, mode: str = "qa", **kwargs) -> dict:
-        """Dispatch to mode-specific forward pass.
-
-        Args:
-            mode: ``"qa"`` (default) or ``"ntp"``.
-            **kwargs: forwarded to ``forward_qa`` or ``forward_ntp``.
-        """
-        if mode == "ntp":
-            return self.forward_ntp(**kwargs)
-        return self.forward_qa(**kwargs)
-
-    def forward_qa(
+    def forward(
         self,
         context_ids: torch.Tensor,
         context_mask: torch.Tensor,
@@ -450,21 +306,11 @@ class TaskCompressorModel(nn.Module):
         prompt_mask: torch.Tensor,
         response_ids: torch.Tensor,
         response_mask: torch.Tensor,
-        teacher_input_ids: torch.Tensor | None = None,
-        teacher_attention_mask: torch.Tensor | None = None,
-        response_starts: torch.Tensor | None = None,
-        response_lens: torch.Tensor | None = None,
-        distill_alpha: float = 0.0,
-        distill_temperature: float = 2.0,
-        distill_method: str = "kl",
     ) -> dict:
         """Full QA training forward pass.
 
-        Returns dict with ``loss``, ``qa_loss``, ``distill_loss``.
+        Returns dict with ``loss`` and ``qa_loss``.
         """
-        B = context_ids.shape[0]
-        device = context_ids.device
-
         # 1. Encode context
         encoder_hidden = self.encode(context_ids, context_mask)
 
@@ -479,7 +325,6 @@ class TaskCompressorModel(nn.Module):
         )
         student_logits = dec_out["logits"]
         labels = dec_out["labels"]
-        prefix_len = dec_out["prefix_len"]
 
         # 4. QA loss (CE on response tokens, fp32 for numerical safety)
         shift_logits = student_logits[:, :-1, :].contiguous().float()
@@ -490,49 +335,9 @@ class TaskCompressorModel(nn.Module):
             ignore_index=-100,
         )
 
-        # 5. Distillation loss (optional)
-        distill_loss = torch.tensor(0.0, device=device)
-        if (
-            distill_alpha > 0
-            and teacher_input_ids is not None
-            and response_starts is not None
-        ):
-            teacher_logits = self.teacher_forward(
-                teacher_input_ids, teacher_attention_mask
-            )
-
-            # Extract response-predicting logits
-            L_t = response_ids.shape[1]
-            V = student_logits.shape[-1]
-
-            # Student: logits at positions [prefix_len-1, prefix_len-1+L_t)
-            student_resp = student_logits[:, prefix_len - 1: prefix_len - 1 + L_t, :]
-
-            # Teacher: per-sample extraction (response_starts vary)
-            teacher_resp = torch.zeros(B, L_t, V, device=device, dtype=student_resp.dtype)
-            for i in range(B):
-                start = response_starts[i].item() - 1
-                length = min(response_lens[i].item(), L_t)
-                teacher_resp[i, :length] = teacher_logits[i, start: start + length].to(student_resp.dtype)
-
-            if distill_method == "kl":
-                student_log_p = F.log_softmax(student_resp.float() / distill_temperature, dim=-1)
-                teacher_p = F.softmax(teacher_resp.float() / distill_temperature, dim=-1)
-                kl = F.kl_div(student_log_p, teacher_p, reduction="none").sum(-1)
-                kl = kl * response_mask.float()
-                distill_loss = kl.sum() / response_mask.float().sum().clamp(min=1)
-                distill_loss = distill_loss * (distill_temperature ** 2)
-            else:  # mse
-                # Extract hidden states instead — simplified: use logits MSE
-                mse = (student_resp - teacher_resp).pow(2).mean(-1)
-                mse = mse * response_mask.float()
-                distill_loss = mse.sum() / response_mask.float().sum().clamp(min=1)
-
-        total_loss = qa_loss + distill_alpha * distill_loss
         return {
-            "loss": total_loss,
+            "loss": qa_loss,
             "qa_loss": qa_loss,
-            "distill_loss": distill_loss,
         }
 
     # ── Inference ────────────────────────────────────────────────────────

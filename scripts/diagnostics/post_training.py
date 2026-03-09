@@ -3,24 +3,14 @@
 
 Exp 6 — Compression Fidelity: Multi-batch cosine similarity between compressed and original.
 Exp 7 — Context Length Scaling: Loss vs context token length.
-Exp 8 — Distillation Effectiveness: KL divergence, token prediction agreement (Stage 2 only).
 
-Supports both Stage 1 (NTP) and Stage 2 (QA) modes.
 Requires a trained checkpoint and evaluation data.
 
 Usage:
-    # Stage 1 (NTP)
-    python scripts/diagnostics/post_training.py --stage 1 \
+    python scripts/diagnostics/post_training.py \
         --config configs/default.yaml \
         --checkpoint outputs/checkpoint.pt \
         --experiments 6,7
-
-    # Stage 2 (QA)
-    python scripts/diagnostics/post_training.py --stage 2 \
-        --config configs/default.yaml \
-        --checkpoint outputs/checkpoint.pt \
-        --data_path ../deep_compressor/data/qa_dev.json \
-        --experiments 6,7,8
 """
 
 from __future__ import annotations
@@ -43,15 +33,14 @@ from scripts.diagnostics.common import (
     init_wandb,
     load_model,
     log_wandb,
-    prepare_ntp_loader,
     prepare_qa_loader,
     to_device,
 )
 from task_compressor.config import Config
-from task_compressor.data import NTPCollator, NTPDataset, QACollator, QADataset
+from task_compressor.data import QACollator, QADataset
 
 
-ALL_EXPERIMENTS = ["6", "7", "8"]
+ALL_EXPERIMENTS = ["6", "7"]
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -62,18 +51,12 @@ def run_compression_fidelity(
     model,
     eval_loader: DataLoader,
     device: torch.device,
-    stage: int,
     max_batches: int = 10,
 ) -> dict:
-    """Measure how well compressed soft prompts preserve context information.
+    """Measure how well compressed soft prompts preserve context information."""
 
-    Compares cosine similarity between compressed representations and
-    encoder hidden states against random baselines.
-    """
-
-    mode_str = "NTP" if stage == 1 else "QA"
     print("\n" + "=" * 76)
-    print(f"  EXPERIMENT 6: Compression Fidelity ({mode_str})")
+    print("  EXPERIMENT 6: Compression Fidelity (QA)")
     print("=" * 76)
 
     model.eval()
@@ -91,19 +74,14 @@ def run_compression_fidelity(
         num_batches += 1
 
         with torch.no_grad():
-            if stage == 1:
-                encoder_hidden = model.encode(batch["doc_ids"], batch["doc_mask"])
-                encoder_mask = batch["doc_mask"]
-                compressed = model.compress_ntp(encoder_hidden, encoder_mask)
-            else:
-                encoder_hidden = model.encode(
-                    batch["context_ids"], batch["context_mask"]
-                )
-                encoder_mask = batch["context_mask"]
-                compressed = model.compress(
-                    encoder_hidden, encoder_mask,
-                    batch["prompt_ids"], batch["prompt_mask"],
-                )
+            encoder_hidden = model.encode(
+                batch["context_ids"], batch["context_mask"]
+            )
+            encoder_mask = batch["context_mask"]
+            compressed = model.compress(
+                encoder_hidden, encoder_mask,
+                batch["prompt_ids"], batch["prompt_mask"],
+            )
 
             # Mean pooled representations
             compressed_pooled = compressed.float().mean(dim=1)
@@ -169,20 +147,14 @@ def run_length_scaling(
     data_path: str,
     config: Config,
     device: torch.device,
-    stage: int,
     length_buckets: list[int] | None = None,
     samples_per_bucket: int = 20,
     tokenizer=None,
 ) -> dict:
-    """Measure loss as a function of context length.
+    """Measure loss as a function of context length."""
 
-    For Stage 1: measures NTP loss vs document length.
-    For Stage 2: measures QA loss vs context token length.
-    """
-
-    mode_str = "NTP" if stage == 1 else "QA"
     print("\n" + "=" * 76)
-    print(f"  EXPERIMENT 7: Context Length Scaling ({mode_str})")
+    print("  EXPERIMENT 7: Context Length Scaling (QA)")
     print("=" * 76)
 
     model.eval()
@@ -196,25 +168,15 @@ def run_length_scaling(
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
 
-    if stage == 1:
-        ds = NTPDataset(
-            data_path,
-            tokenizer,
-            max_context_length=max(length_buckets) + 256,
-            ntp_segment_len=config.data.ntp_segment_len,
-        )
-        collator = NTPCollator(pad_token_id=tokenizer.pad_token_id)
-        len_key = "doc_ids"
-    else:
-        ds = QADataset(
-            data_path,
-            tokenizer,
-            max_context_length=max(length_buckets) + 256,
-            max_prompt_length=config.data.max_prompt_length,
-            max_response_length=config.data.max_response_length,
-        )
-        collator = QACollator(pad_token_id=tokenizer.pad_token_id)
-        len_key = "context_ids"
+    ds = QADataset(
+        data_path,
+        tokenizer,
+        max_context_length=max(length_buckets) + 256,
+        max_prompt_length=config.data.max_prompt_length,
+        max_response_length=config.data.max_response_length,
+    )
+    collator = QACollator(pad_token_id=tokenizer.pad_token_id)
+    len_key = "context_ids"
 
     print(f"\n  Scanning {len(ds)} samples for length distribution...")
     buckets: dict[int, list[int]] = {b: [] for b in length_buckets}
@@ -252,28 +214,15 @@ def run_length_scaling(
         with torch.no_grad():
             for batch in loader:
                 batch = to_device(batch, device)
-                if stage == 1:
-                    outputs = model(
-                        mode="ntp",
-                        doc_ids=batch["doc_ids"],
-                        doc_mask=batch["doc_mask"],
-                        segment_ids=batch["segment_ids"],
-                        segment_mask=batch["segment_mask"],
-                        segment_labels=batch["segment_labels"],
-                    )
-                    batch_losses.append(outputs["ntp_loss"].item())
-                else:
-                    outputs = model(
-                        mode="qa",
-                        context_ids=batch["context_ids"],
-                        context_mask=batch["context_mask"],
-                        prompt_ids=batch["prompt_ids"],
-                        prompt_mask=batch["prompt_mask"],
-                        response_ids=batch["response_ids"],
-                        response_mask=batch["response_mask"],
-                        distill_alpha=0.0,
-                    )
-                    batch_losses.append(outputs["qa_loss"].item())
+                outputs = model(
+                    context_ids=batch["context_ids"],
+                    context_mask=batch["context_mask"],
+                    prompt_ids=batch["prompt_ids"],
+                    prompt_mask=batch["prompt_mask"],
+                    response_ids=batch["response_ids"],
+                    response_mask=batch["response_mask"],
+                )
+                batch_losses.append(outputs["qa_loss"].item())
 
         mean_loss = sum(batch_losses) / len(batch_losses)
         std_loss = (
@@ -320,137 +269,11 @@ def run_length_scaling(
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  Experiment 8 — Distillation Effectiveness (Stage 2 only)
-# ═══════════════════════════════════════════════════════════════════════
-
-def run_distillation_effectiveness(
-    model,
-    eval_loader: DataLoader,
-    device: torch.device,
-    max_batches: int = 10,
-) -> dict:
-    """Compare student and teacher outputs on evaluation data.
-
-    Measures:
-      - KL divergence between student and teacher logit distributions
-      - Token prediction agreement (argmax match rate)
-
-    Note: This experiment is only applicable to Stage 2 (QA) mode.
-    """
-
-    print("\n" + "=" * 76)
-    print("  EXPERIMENT 8: Distillation Effectiveness (QA Stage 2 only)")
-    print("=" * 76)
-
-    model.eval()
-
-    kl_divs = []
-    agreement_rates = []
-
-    num_batches = 0
-    for batch in eval_loader:
-        if num_batches >= max_batches:
-            break
-
-        # Skip if no teacher fields
-        if "teacher_input_ids" not in batch:
-            continue
-
-        batch = to_device(batch, device)
-        num_batches += 1
-
-        with torch.no_grad():
-            # Student path
-            encoder_hidden = model.encode(
-                batch["context_ids"], batch["context_mask"]
-            )
-            compressed = model.compress(
-                encoder_hidden, batch["context_mask"],
-                batch["prompt_ids"], batch["prompt_mask"],
-            )
-            dec_out = model.decode_train(
-                compressed,
-                batch["prompt_ids"], batch["prompt_mask"],
-                batch["response_ids"], batch["response_mask"],
-            )
-
-            # Teacher path
-            teacher_logits = model.teacher_forward(
-                batch["teacher_input_ids"],
-                batch["teacher_attention_mask"],
-            )
-
-            # Extract response-predicting logits
-            prefix_len = dec_out["prefix_len"]
-            L_t = batch["response_ids"].shape[1]
-            student_resp = dec_out["logits"][:, prefix_len - 1: prefix_len - 1 + L_t, :]
-
-            B = batch["context_ids"].shape[0]
-            V = student_resp.shape[-1]
-            teacher_resp = torch.zeros(B, L_t, V, device=device, dtype=student_resp.dtype)
-            for i in range(B):
-                start = batch["response_starts"][i].item() - 1
-                length = min(batch["response_lens"][i].item(), L_t)
-                teacher_resp[i, :length] = teacher_logits[i, start: start + length].to(student_resp.dtype)
-
-            resp_mask = batch["response_mask"].float()
-
-            # KL divergence
-            T = 2.0
-            student_log_p = F.log_softmax(student_resp / T, dim=-1)
-            teacher_p = F.softmax(teacher_resp / T, dim=-1)
-            kl = F.kl_div(student_log_p, teacher_p, reduction="none").sum(-1)
-            kl = (kl * resp_mask).sum() / resp_mask.sum().clamp(min=1)
-            kl_divs.append(kl.item())
-
-            # Token prediction agreement
-            student_preds = student_resp.argmax(dim=-1)
-            teacher_preds = teacher_resp.argmax(dim=-1)
-            match = (student_preds == teacher_preds).float() * resp_mask
-            agreement = (match.sum() / resp_mask.sum().clamp(min=1)).item()
-            agreement_rates.append(agreement)
-
-    if num_batches == 0:
-        print("  WARNING: No batches with teacher data found")
-        return {}
-
-    avg_kl = sum(kl_divs) / len(kl_divs)
-    avg_agree = sum(agreement_rates) / len(agreement_rates)
-
-    print(f"\n  Aggregated over {num_batches} batches:")
-    print(f"\n  {'Metric':<45}  {'Value':>12}")
-    print(f"  {'─' * 60}")
-    print(f"  {'KL divergence (student || teacher)':<45}  {avg_kl:>12.4f}")
-    print(f"  {'Token prediction agreement':<45}  {avg_agree:>12.2%}")
-    print(f"  {'─' * 60}")
-
-    print(f"\n  DIAGNOSIS:")
-    if avg_agree > 0.8:
-        print(f"  PASS — High teacher-student agreement ({avg_agree:.1%})")
-    elif avg_agree > 0.5:
-        print(f"  INFO — Moderate agreement ({avg_agree:.1%})")
-    else:
-        print(f"  WARNING — Low agreement ({avg_agree:.1%})")
-
-    if avg_kl < 1.0:
-        print(f"  KL divergence is low ({avg_kl:.4f}) — distributions are close")
-    elif avg_kl < 5.0:
-        print(f"  KL divergence is moderate ({avg_kl:.4f})")
-    else:
-        print(f"  KL divergence is high ({avg_kl:.4f}) — significant distribution gap")
-
-    return {
-        "kl_divergence": avg_kl,
-        "token_agreement": avg_agree,
-    }
-
-
-# ═══════════════════════════════════════════════════════════════════════
 #  Main
 # ═══════════════════════════════════════════════════════════════════════
 
 def main():
-    parser = base_parser("Task Compressor post-training diagnostics (Exp 6-8)")
+    parser = base_parser("Task Compressor post-training diagnostics (Exp 6-7)")
     parser.add_argument(
         "--checkpoint", type=str, required=True,
         help="Path to trained checkpoint",
@@ -460,8 +283,8 @@ def main():
     parser.add_argument("--max_samples", type=int, default=0,
                         help="Limit eval samples (0 = all)")
     parser.add_argument(
-        "--experiments", type=str, default="6,7,8",
-        help="Comma-separated list of experiments to run (6-8)",
+        "--experiments", type=str, default="6,7",
+        help="Comma-separated list of experiments to run (6-7)",
     )
     parser.add_argument(
         "--length_buckets", type=str, default="256,512,1024,2048,4096",
@@ -472,25 +295,18 @@ def main():
 
     experiments = [e.strip() for e in args.experiments.split(",")]
 
-    # Exp 8 is QA-only
-    if args.stage == 1 and "8" in experiments:
-        print("NOTE: Experiment 8 (Distillation) is only for Stage 2 (QA). Skipping.")
-        experiments = [e for e in experiments if e != "8"]
-
     device = detect_device()
     torch_dtype = detect_dtype(device, args.no_bf16)
 
     wandb_run = init_wandb(
         enabled=args.wandb,
         project=args.wandb_project,
-        run_name=f"post-training-diag-stage{args.stage}",
-        config={"stage": args.stage, "checkpoint": args.checkpoint,
+        run_name="post-training-diag",
+        config={"checkpoint": args.checkpoint,
                 "experiments": experiments},
         entity=args.wandb_entity,
     )
 
-    mode_str = "NTP (Stage 1)" if args.stage == 1 else "QA (Stage 2)"
-    print(f"Mode: {mode_str}")
     print(f"Device: {device}  dtype: {torch_dtype}")
     config = Config.from_yaml(args.config)
 
@@ -503,7 +319,7 @@ def main():
 
     data_path = args.data_path
     if data_path is None:
-        data_path = auto_detect_data_path(args.stage)
+        data_path = auto_detect_data_path()
         if data_path is None:
             print("ERROR: No data found. Provide --data_path.")
             sys.exit(1)
@@ -511,23 +327,16 @@ def main():
     # ── experiments ───────────────────────────────────────────────────
     all_results = {}
 
-    if any(e in experiments for e in ("6", "8")):
-        if args.stage == 1:
-            eval_loader, tokenizer = prepare_ntp_loader(
-                config, data_path, args.batch_size,
-                max_samples=args.max_samples,
-            )
-        else:
-            eval_loader, tokenizer = prepare_qa_loader(
-                config, data_path, args.batch_size,
-                max_samples=args.max_samples,
-            )
+    if "6" in experiments:
+        eval_loader, tokenizer = prepare_qa_loader(
+            config, data_path, args.batch_size,
+            max_samples=args.max_samples,
+        )
         print(f"\n  Eval loader: {len(eval_loader)} batches")
 
-    if "6" in experiments:
         torch.manual_seed(42)
         exp6 = run_compression_fidelity(
-            model, eval_loader, device, stage=args.stage,
+            model, eval_loader, device,
             max_batches=args.max_batches,
         )
         all_results["fidelity"] = exp6
@@ -538,7 +347,7 @@ def main():
         torch.manual_seed(42)
         length_buckets = [int(x) for x in args.length_buckets.split(",")]
         exp7 = run_length_scaling(
-            model, data_path, config, device, stage=args.stage,
+            model, data_path, config, device,
             length_buckets=length_buckets,
         )
         all_results["length_scaling"] = exp7
@@ -548,15 +357,6 @@ def main():
                 {f"exp7/{k}": v for k, v in exp7.items()
                  if isinstance(v, (int, float))},
             )
-
-    if "8" in experiments:
-        torch.manual_seed(42)
-        exp8 = run_distillation_effectiveness(
-            model, eval_loader, device, max_batches=args.max_batches
-        )
-        all_results["distillation"] = exp8
-        if wandb_run:
-            log_wandb(wandb_run, {f"exp8/{k}": v for k, v in exp8.items()})
 
     finish_wandb(wandb_run)
     print()

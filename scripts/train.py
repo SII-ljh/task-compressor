@@ -1,14 +1,7 @@
 #!/usr/bin/env python3
-"""Train Task Compressor (two-stage).
+"""Train Task Compressor (single-stage QA).
 
-Stage 1 — NTP pretraining:
-  python scripts/train.py --config configs/default.yaml training.stage=1
-
-Stage 2 — QA fine-tuning (resume from Stage 1):
-  python scripts/train.py --config configs/default.yaml \
-      training.stage=2 training.resume_from=outputs/final
-
-General usage:
+Usage:
   # Single GPU
   python scripts/train.py --config configs/default.yaml
 
@@ -35,11 +28,11 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from task_compressor.config import Config
-from task_compressor.data import NTPCollator, NTPDataset, QACollator, QADataset
+from task_compressor.data import QACollator, QADataset
 from task_compressor.models.task_compressor_model import TaskCompressorModel
 from task_compressor.trainer import Trainer
 
-from torch.utils.data import DataLoader, DistributedSampler, random_split
+from torch.utils.data import DataLoader, DistributedSampler
 from transformers import AutoTokenizer
 
 logger = logging.getLogger(__name__)
@@ -70,7 +63,7 @@ def parse_args():
 
 
 def load_checkpoint(model: TaskCompressorModel, ckpt_dir: str) -> None:
-    """Load Stage 1 checkpoint into model (LoRA adapter + task compressor modules)."""
+    """Load checkpoint into model (LoRA adapter + task compressor modules)."""
     ckpt_path = Path(ckpt_dir)
     logger.info(f"Loading checkpoint from {ckpt_path}")
 
@@ -115,9 +108,6 @@ def main():
             overrides[k] = v
         config.merge_overrides(overrides)
 
-    stage = config.training.stage
-    mode = "ntp" if stage == 1 else "qa"
-
     # ── Logging ──────────────────────────────────────────────────────────
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     logging.basicConfig(
@@ -126,7 +116,6 @@ def main():
     )
 
     if local_rank == 0:
-        logger.info(f"Stage {stage} ({mode} mode)")
         logger.info(f"Config: {config.to_dict()}")
 
     # ── Distributed init ─────────────────────────────────────────────────
@@ -146,40 +135,21 @@ def main():
     # ── Datasets ─────────────────────────────────────────────────────────
     logger.info("Loading datasets ...")
 
-    if stage == 1:
-        # NTP pretraining
-        full_dataset = NTPDataset(
-            data_path=config.data.ntp_train_file,
-            tokenizer=tokenizer,
-            max_context_length=config.data.max_context_length,
-            ntp_segment_len=config.data.ntp_segment_len,
-        )
-        # Split last 5% as dev set (min 1 sample)
-        n_dev = max(1, len(full_dataset) // 20)
-        n_train = len(full_dataset) - n_dev
-        train_dataset, dev_dataset = random_split(
-            full_dataset,
-            [n_train, n_dev],
-            generator=torch.Generator().manual_seed(config.seed),
-        )
-        collator = NTPCollator(pad_token_id=tokenizer.pad_token_id)
-    else:
-        # QA fine-tuning (Stage 2)
-        train_dataset = QADataset(
-            data_path=config.data.train_file,
-            tokenizer=tokenizer,
-            max_context_length=config.data.max_context_length,
-            max_prompt_length=config.data.max_prompt_length,
-            max_response_length=config.data.max_response_length,
-        )
-        dev_dataset = QADataset(
-            data_path=config.data.dev_file,
-            tokenizer=tokenizer,
-            max_context_length=config.data.max_context_length,
-            max_prompt_length=config.data.max_prompt_length,
-            max_response_length=config.data.max_response_length,
-        )
-        collator = QACollator(pad_token_id=tokenizer.pad_token_id)
+    train_dataset = QADataset(
+        data_path=config.data.train_file,
+        tokenizer=tokenizer,
+        max_context_length=config.data.max_context_length,
+        max_prompt_length=config.data.max_prompt_length,
+        max_response_length=config.data.max_response_length,
+    )
+    dev_dataset = QADataset(
+        data_path=config.data.dev_file,
+        tokenizer=tokenizer,
+        max_context_length=config.data.max_context_length,
+        max_prompt_length=config.data.max_prompt_length,
+        max_response_length=config.data.max_response_length,
+    )
+    collator = QACollator(pad_token_id=tokenizer.pad_token_id)
 
     logger.info(f"  Train: {len(train_dataset)} samples")
     logger.info(f"  Dev:   {len(dev_dataset)} samples")
@@ -213,8 +183,8 @@ def main():
     torch_dtype = torch.bfloat16 if config.training.bf16 else torch.float32
     model = TaskCompressorModel(config.model, torch_dtype=torch_dtype)
 
-    # Resume from Stage 1 checkpoint for Stage 2
-    if stage == 2 and config.training.resume_from:
+    # Resume from checkpoint if specified
+    if config.training.resume_from:
         load_checkpoint(model, config.training.resume_from)
 
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -225,8 +195,8 @@ def main():
     )
 
     # ── Train ────────────────────────────────────────────────────────────
-    trainer = Trainer(model, config, train_loader, dev_loader, mode=mode)
-    logger.info(f"Starting Stage {stage} training ({mode} mode) ...")
+    trainer = Trainer(model, config, train_loader, dev_loader, tokenizer=tokenizer)
+    logger.info("Starting training ...")
     trainer.train()
     logger.info("Training complete!")
 

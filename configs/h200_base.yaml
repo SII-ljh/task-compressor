@@ -1,0 +1,66 @@
+# ============================================================
+# Task Compressor — Base config for 8×H200 (141GB HBM3e each)
+# ============================================================
+# Usage:
+#   torchrun --nproc_per_node=8 scripts/train.py --config configs/h200_base.yaml
+#
+# Override compression ratio:
+#   torchrun --nproc_per_node=8 scripts/train.py --config configs/h200_base.yaml \
+#       model.n_prompt_tokens=32 model.n_context_tokens=96
+
+model:
+  base_model: "models/Qwen3-0.6B"
+  lora_rank: 128
+  lora_alpha: 128
+  lora_target_modules: ["q_proj", "v_proj"]
+  lora_dropout: 0.0
+  n_prompt_tokens: 16        # n_p (default: 16)
+  n_context_tokens: 48       # n_c (default: 48)
+  # total soft prompts k = n_p + n_c = 64
+  num_perceiver_layers: 2
+  perceiver_ffn_mult: 4
+  gradient_checkpointing: true
+
+training:
+  # ── Batch size ──
+  # effective_batch = per_gpu × num_gpus × grad_accum = 8 × 8 × 2 = 128
+  per_gpu_batch_size: 8
+  gradient_accumulation_steps: 2
+
+  # ── Schedule ──
+  warmup_steps: 1000
+  total_steps: 30000          # ~8 epochs over 483K samples @ batch 128
+
+  # ── Learning rates (differential) ──
+  lora_lr: 1.0e-5
+  perceiver_lr: 5.0e-5
+
+  # ── Regularization ──
+  max_grad_norm: 5.0
+  weight_decay: 0.01
+
+  # ── Precision ──
+  bf16: true
+  deepspeed: null
+
+  # ── Checkpointing ──
+  save_steps: 2000
+  eval_steps: 500
+  logging_steps: 10
+  max_eval_samples: 5000
+  num_sample_predictions: 3
+
+  resume_from: null
+
+data:
+  max_context_length: 4096
+  max_prompt_length: 256
+  max_response_length: 512
+  train_file: "data/qa_large_train.json"
+  dev_file: "data/qa_large_dev.json"
+  num_workers: 8              # H200 nodes have plenty of CPU cores
+
+output_dir: "outputs"
+wandb_project: "task-compressor"
+wandb_run_name: null
+seed: 42
