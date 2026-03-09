@@ -45,6 +45,9 @@ class Trainer:
         self._running_loss = 0.0
         self._running_count = 0
 
+        # Best eval loss for early-stopping / best checkpoint
+        self.best_eval_loss = float("inf")
+
         # Distributed setup
         self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
         self.world_size = int(os.environ.get("WORLD_SIZE", 1))
@@ -259,15 +262,25 @@ class Trainer:
         avg_loss = total_loss / max(n_samples, 1)
         ppl = math.exp(min(avg_loss, 20.0))
 
+        # Track best eval loss and save best checkpoint
+        improved = ""
+        if avg_loss < self.best_eval_loss:
+            self.best_eval_loss = avg_loss
+            improved = "  ** best **"
+            if self.is_main:
+                self._save_checkpoint(tag="best")
+
         if self.is_main:
             logger.info(
                 f"[Eval] step {self.global_step}/{tc.total_steps}  "
                 f"eval_loss={avg_loss:.4f}  eval_ppl={ppl:.2f}  "
-                f"samples={n_samples}"
+                f"best={self.best_eval_loss:.4f}  "
+                f"samples={n_samples}{improved}"
             )
             metrics = {
                 "eval/loss": avg_loss,
                 "eval/ppl": ppl,
+                "eval/best_loss": self.best_eval_loss,
                 "eval/samples": n_samples,
                 "step": self.global_step,
             }

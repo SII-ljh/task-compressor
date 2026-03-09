@@ -29,9 +29,9 @@ training:
 
   # ── Schedule ──
   # steps_per_epoch = 483813 / 256 ≈ 1890
-  # 20000 steps ≈ 10.6 epochs
+  # 10000 steps ≈ 5.3 epochs
   warmup_steps: 500
-  total_steps: 20000
+  total_steps: 10000
 
   # ── Learning rates (differential) ──
   lora_lr: 1.0e-5

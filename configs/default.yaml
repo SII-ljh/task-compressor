@@ -20,7 +20,7 @@ training:
   gradient_accumulation_steps: 4
   # effective batch_size = per_gpu * grad_accum = 128 (single GPU)
   warmup_steps: 500
-  total_steps: 40000          # ~10.6 epochs over 483K samples @ batch 128
+  total_steps: 20000          # ~5.3 epochs over 483K samples @ batch 128
   lora_lr: 1.0e-5
   perceiver_lr: 5.0e-5
   max_grad_norm: 5.0
