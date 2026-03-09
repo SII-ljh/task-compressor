@@ -9,20 +9,24 @@
 #   k=128 ( 32x compression)  n_p=32, n_c=96
 #   k=256 ( 16x compression)  n_p=64, n_c=192
 #
+# If one experiment fails, it logs the failure and continues
+# with the remaining experiments.
+#
 # Usage:
 #   bash scripts/run_compression_ablation.sh          # run all
 #   bash scripts/run_compression_ablation.sh 64       # run k=64 only
 #   bash scripts/run_compression_ablation.sh 16 32    # run k=16 and k=32
 # ============================================================
 
-set -euo pipefail
+set -uo pipefail
+# NOTE: no 'set -e' — we handle errors per-experiment
 
 CONFIG="configs/h200_base.yaml"
 NUM_GPUS=8
 BASE_OUTPUT="outputs/ablation_compression"
 
 # ── Experiment definitions ──
-# Format: "k n_p n_c"
+# Format: "n_p n_c"
 declare -A EXPERIMENTS=(
     [16]="4 12"
     [32]="8 24"
@@ -38,6 +42,11 @@ else
     SELECTED_K=(16 32 64 128 256)
 fi
 
+# Track results
+PASSED=()
+FAILED=()
+SKIPPED=()
+
 echo "================================================================"
 echo "  Compression Ratio Ablation — 8×H200"
 echo "  Config:  ${CONFIG}"
@@ -48,7 +57,8 @@ echo "================================================================"
 for K in "${SELECTED_K[@]}"; do
     if [ -z "${EXPERIMENTS[$K]+x}" ]; then
         echo "ERROR: Unknown k=${K}. Valid values: 16, 32, 64, 128, 256"
-        exit 1
+        FAILED+=("k=${K} (unknown)")
+        continue
     fi
 
     read -r NP NC <<< "${EXPERIMENTS[$K]}"
@@ -65,21 +75,37 @@ for K in "${SELECTED_K[@]}"; do
     # Skip if final checkpoint already exists
     if [ -d "${OUTPUT_DIR}/final" ]; then
         echo "  → SKIPPING: final checkpoint already exists"
+        SKIPPED+=("k=${K}")
         continue
     fi
 
-    torchrun --nproc_per_node=${NUM_GPUS} \
+    if torchrun --nproc_per_node=${NUM_GPUS} \
         scripts/train.py --config ${CONFIG} \
         model.n_prompt_tokens=${NP} \
         model.n_context_tokens=${NC} \
         output_dir="${OUTPUT_DIR}" \
-        wandb_run_name="${RUN_NAME}"
-
-    echo "  → Completed: k=${K}"
+        wandb_run_name="${RUN_NAME}"; then
+        echo "  → PASSED: k=${K}"
+        PASSED+=("k=${K}")
+    else
+        echo "  → FAILED: k=${K} (exit code $?)"
+        echo "  → Continuing with next experiment..."
+        FAILED+=("k=${K}")
+    fi
 done
 
+# ── Summary ──────────────────────────────────────────────────
 echo ""
 echo "================================================================"
-echo "  All experiments finished!"
-echo "  Results in: ${BASE_OUTPUT}/"
+echo "  Ablation Summary"
 echo "================================================================"
+echo "  Passed:  ${#PASSED[@]}  ${PASSED[*]:-}"
+echo "  Failed:  ${#FAILED[@]}  ${FAILED[*]:-}"
+echo "  Skipped: ${#SKIPPED[@]}  ${SKIPPED[*]:-}"
+echo "  Results: ${BASE_OUTPUT}/"
+echo "================================================================"
+
+# Exit with error if any experiment failed
+if [ ${#FAILED[@]} -gt 0 ]; then
+    exit 1
+fi
