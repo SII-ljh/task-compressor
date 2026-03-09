@@ -104,7 +104,7 @@ class Trainer:
             {"params": lora_params, "lr": tc.lora_lr},
         ]
         return torch.optim.AdamW(
-            groups, weight_decay=tc.weight_decay
+            groups, weight_decay=tc.weight_decay, eps=1e-5
         )
 
     def _build_scheduler(self):
@@ -212,10 +212,11 @@ class Trainer:
 
         loss = outputs["loss"].float() / tc.gradient_accumulation_steps
         if not torch.isfinite(loss):
-            logger.warning(
-                f"[Step {self.global_step}] Non-finite loss ({loss.item():.4f}), "
-                "zeroing gradients and skipping backward"
+            logger.error(
+                f"[Step {self.global_step}] *** NaN DETECTED *** loss={loss.item():.4f}"
             )
+            # Save diagnostic information for debugging
+            self._save_nan_diagnostics(batch, outputs)
             self.optimizer.zero_grad()
             return {"loss": float("nan")}
         loss.backward()
@@ -283,6 +284,74 @@ class Trainer:
         logger.info(f"[Step {self.global_step}] {metrics}")
         if self._wandb:
             self._wandb.log(metrics, step=self.global_step)
+
+    def _save_nan_diagnostics(self, batch: dict, outputs: dict):
+        """Save detailed diagnostics when NaN is detected."""
+        import pickle
+        from pathlib import Path
+
+        debug_dir = Path(self.config.output_dir) / "nan_debug"
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        dump_path = debug_dir / f"nan_step_{self.global_step}.pt"
+
+        # Collect diagnostic info
+        diagnostics = {
+            "global_step": self.global_step,
+            "mode": self.mode,
+            "lr_perceiver": self.optimizer.param_groups[0]["lr"],
+            "lr_lora": self.optimizer.param_groups[1]["lr"],
+            "batch": {k: v.cpu() for k, v in batch.items()},
+            "outputs": {k: v.cpu() if isinstance(v, torch.Tensor) else v for k, v in outputs.items()},
+        }
+
+        # Save optimizer state (exp_avg, exp_avg_sq)
+        try:
+            diagnostics["optimizer_state"] = {
+                k: {
+                    "exp_avg_mean": v["exp_avg"].float().mean().item() if "exp_avg" in v else None,
+                    "exp_avg_max": v["exp_avg"].float().abs().max().item() if "exp_avg" in v else None,
+                    "exp_avg_sq_mean": v["exp_avg_sq"].float().mean().item() if "exp_avg_sq" in v else None,
+                    "exp_avg_sq_min": v["exp_avg_sq"].float().min().item() if "exp_avg_sq" in v else None,
+                }
+                for k, v in list(self.optimizer.state.items())[:10]  # Sample first 10 params
+            }
+        except Exception as e:
+            logger.warning(f"Failed to extract optimizer state: {e}")
+
+        # Save parameter statistics
+        param_stats = {}
+        for name, param in self.raw_model.named_parameters():
+            if not param.requires_grad:
+                continue
+            try:
+                param_stats[name] = {
+                    "mean": param.float().mean().item(),
+                    "max": param.float().abs().max().item(),
+                    "has_nan": torch.isnan(param).any().item(),
+                    "has_inf": torch.isinf(param).any().item(),
+                }
+                if param.grad is not None:
+                    param_stats[name]["grad_mean"] = param.grad.float().mean().item()
+                    param_stats[name]["grad_max"] = param.grad.float().abs().max().item()
+                    param_stats[name]["grad_has_nan"] = torch.isnan(param.grad).any().item()
+            except Exception:
+                pass
+
+        diagnostics["param_stats"] = param_stats
+
+        # Save to disk
+        torch.save(diagnostics, dump_path)
+        logger.error(f"NaN diagnostics saved to {dump_path}")
+        logger.error(f"  Current LRs: perceiver={diagnostics['lr_perceiver']:.2e}, lora={diagnostics['lr_lora']:.2e}")
+        logger.error(f"  Batch keys: {list(batch.keys())}")
+
+        # Optionally save full optimizer state (large file)
+        full_optim_path = debug_dir / f"optimizer_state_step_{self.global_step}.pt"
+        try:
+            torch.save(self.optimizer.state_dict(), full_optim_path)
+            logger.error(f"Full optimizer state saved to {full_optim_path}")
+        except Exception as e:
+            logger.warning(f"Failed to save full optimizer state: {e}")
 
     def _save_checkpoint(self, tag: str | None = None):
         out_dir = Path(self.config.output_dir)

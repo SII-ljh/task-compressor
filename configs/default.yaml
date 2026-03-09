@@ -23,7 +23,7 @@ training:
   total_steps: 50000
   lora_lr: 1.0e-5
   perceiver_lr: 5.0e-5
-  max_grad_norm: 2.0
+  max_grad_norm: 5.0
   weight_decay: 0.01
   distill_alpha: 0.5
   distill_temperature: 2.0

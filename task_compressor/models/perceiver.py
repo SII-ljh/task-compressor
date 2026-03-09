@@ -14,10 +14,11 @@ import torch.nn.functional as F
 class MultiHeadCrossAttention(nn.Module):
     """Multi-head cross-attention: query attends to key-value."""
 
-    def __init__(self, hidden_size: int, num_heads: int):
+    def __init__(self, hidden_size: int, num_heads: int, logit_cap: float = 50.0):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
+        self.logit_cap = logit_cap  # Soft cap to prevent extreme attention scores
         assert hidden_size % num_heads == 0
 
         self.q_proj = nn.Linear(hidden_size, hidden_size, bias=True)
@@ -46,14 +47,21 @@ class MultiHeadCrossAttention(nn.Module):
         k = self.k_proj(key_value).view(B, Nkv, self.num_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(key_value).view(B, Nkv, self.num_heads, self.head_dim).transpose(1, 2)
 
-        # Use PyTorch 2.0 scaled_dot_product_attention when possible
+        # Apply soft-capping to attention logits to prevent bf16 overflow
+        # logit = cap * tanh(raw_logit / cap) bounds values to [-cap, +cap]
+        scale = math.sqrt(self.head_dim)
+        attn_logits = torch.matmul(q, k.transpose(-2, -1)) / scale
+        if self.logit_cap > 0:
+            attn_logits = self.logit_cap * torch.tanh(attn_logits / self.logit_cap)
+
+        # Apply mask and softmax
         if kv_mask is not None:
-            # (B, Nkv) -> (B, 1, 1, Nkv) for broadcasting
-            attn_mask = kv_mask[:, None, None, :].bool()
-            # SDPA expects True = attend, which matches our mask convention
-            out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
-        else:
-            out = F.scaled_dot_product_attention(q, k, v)
+            # (B, Nkv) -> (B, 1, 1, Nkv)
+            mask_expanded = kv_mask[:, None, None, :].bool()
+            attn_logits = attn_logits.masked_fill(~mask_expanded, float("-inf"))
+
+        attn_weights = F.softmax(attn_logits, dim=-1)
+        out = torch.matmul(attn_weights, v)
 
         out = out.transpose(1, 2).contiguous().view(B, Nq, D)
         return self.o_proj(out)
@@ -62,10 +70,11 @@ class MultiHeadCrossAttention(nn.Module):
 class MultiHeadSelfAttention(nn.Module):
     """Multi-head self-attention."""
 
-    def __init__(self, hidden_size: int, num_heads: int):
+    def __init__(self, hidden_size: int, num_heads: int, logit_cap: float = 50.0):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
+        self.logit_cap = logit_cap  # Soft cap to prevent extreme attention scores
         assert hidden_size % num_heads == 0
 
         self.q_proj = nn.Linear(hidden_size, hidden_size, bias=True)
@@ -85,7 +94,14 @@ class MultiHeadSelfAttention(nn.Module):
         k = self.k_proj(x).view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
 
-        out = F.scaled_dot_product_attention(q, k, v)
+        # Apply soft-capping to attention logits to prevent bf16 overflow
+        scale = math.sqrt(self.head_dim)
+        attn_logits = torch.matmul(q, k.transpose(-2, -1)) / scale
+        if self.logit_cap > 0:
+            attn_logits = self.logit_cap * torch.tanh(attn_logits / self.logit_cap)
+
+        attn_weights = F.softmax(attn_logits, dim=-1)
+        out = torch.matmul(attn_weights, v)
         out = out.transpose(1, 2).contiguous().view(B, N, D)
         return self.o_proj(out)
 
