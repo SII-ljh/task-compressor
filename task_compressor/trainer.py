@@ -44,6 +44,7 @@ class Trainer:
         # Running loss accumulator for smoothed logging
         self._running_loss = 0.0
         self._running_count = 0
+        self._last_grad_norm = 0.0
 
         # Best eval loss for early-stopping / best checkpoint
         self.best_eval_loss = float("inf")
@@ -144,7 +145,8 @@ class Trainer:
                     grad_norm = torch.nn.utils.clip_grad_norm_(
                         self.raw_model.parameters(), tc.max_grad_norm
                     )
-                    metrics["grad_norm"] = grad_norm.item()
+                    self._last_grad_norm = grad_norm.item()
+                    metrics["grad_norm"] = self._last_grad_norm
 
                     if torch.isfinite(grad_norm):
                         self.optimizer.step()
@@ -360,7 +362,7 @@ class Trainer:
 
         ppl = math.exp(min(avg_loss, 20.0))
         lr = metrics.get("lr_perceiver", 0.0)
-        grad_norm = metrics.get("grad_norm", 0.0)
+        grad_norm = metrics.get("grad_norm", self._last_grad_norm)
 
         logger.info(
             f"step {self.global_step}/{tc.total_steps}  "
