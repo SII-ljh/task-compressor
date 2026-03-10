@@ -29,16 +29,17 @@ NUM_GPUS=8
 BASE_OUTPUT="outputs/ablation_compression"
 
 # ── Experiment definitions ──
-# Format: "n_p n_c"
+# Format: "n_p n_c per_gpu_batch_size grad_accum"
+# effective_batch = per_gpu_bs × num_gpus × grad_accum = 256 for all
 declare -A EXPERIMENTS=(
-    [16]="4 12"
-    [32]="8 24"
-    [64]="16 48"
-    [128]="32 96"
-    [256]="64 192"
-    [512]="128 384"
-    [1024]="256 768"
-    [2048]="512 1536"
+    [16]="4 12 32 1"
+    [32]="8 24 32 1"
+    [64]="16 48 32 1"
+    [128]="32 96 32 1"
+    [256]="64 192 32 1"
+    [512]="128 384 16 2"
+    [1024]="256 768 8 4"
+    [2048]="512 1536 4 8"
 )
 
 # ── Parse CLI args: which k values to run ──
@@ -67,7 +68,7 @@ for K in "${SELECTED_K[@]}"; do
         continue
     fi
 
-    read -r NP NC <<< "${EXPERIMENTS[$K]}"
+    read -r NP NC BS GA <<< "${EXPERIMENTS[$K]}"
     RUN_NAME="k${K}_np${NP}_nc${NC}"
     OUTPUT_DIR="${BASE_OUTPUT}/${RUN_NAME}"
 
@@ -75,6 +76,7 @@ for K in "${SELECTED_K[@]}"; do
     echo "────────────────────────────────────────────────────────────────"
     echo "  Experiment: k=${K}  (n_p=${NP}, n_c=${NC})"
     echo "  Compression: ~$((4096 / K))x  (4096 context → ${K} soft prompts)"
+    echo "  Batch: per_gpu=${BS}, grad_accum=${GA}, effective=$((BS * NUM_GPUS * GA))"
     echo "  Output: ${OUTPUT_DIR}"
     echo "────────────────────────────────────────────────────────────────"
 
@@ -89,6 +91,8 @@ for K in "${SELECTED_K[@]}"; do
         scripts/train.py --config ${CONFIG} \
         model.n_prompt_tokens=${NP} \
         model.n_context_tokens=${NC} \
+        training.per_gpu_batch_size=${BS} \
+        training.gradient_accumulation_steps=${GA} \
         output_dir="${OUTPUT_DIR}" \
         wandb_run_name="${RUN_NAME}"; then
         echo "  → PASSED: k=${K}"
