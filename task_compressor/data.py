@@ -72,24 +72,42 @@ class QACollator:
         - response_ids, response_mask  (B, max_L_t)
     """
 
-    def __init__(self, pad_token_id: int):
+    def __init__(
+        self,
+        pad_token_id: int,
+        max_context_length: int | None = None,
+        max_prompt_length: int | None = None,
+        max_response_length: int | None = None,
+    ):
         self.pad_token_id = pad_token_id
+        self.max_context_length = max_context_length
+        self.max_prompt_length = max_prompt_length
+        self.max_response_length = max_response_length
+
+    def _pad(self, tensors: list[torch.Tensor], fixed_len: int | None) -> torch.Tensor:
+        """Pad tensors to fixed_len (if set) or to max length in batch."""
+        if fixed_len is not None:
+            return torch.stack([
+                torch.nn.functional.pad(
+                    t[:fixed_len],
+                    (0, fixed_len - min(len(t), fixed_len)),
+                    value=self.pad_token_id,
+                )
+                for t in tensors
+            ])
+        return pad_sequence(
+            tensors, batch_first=True, padding_value=self.pad_token_id
+        )
 
     def __call__(self, batch: list[dict]) -> dict:
         context_ids_list = [item["context_ids"] for item in batch]
         prompt_ids_list = [item["prompt_ids"] for item in batch]
         response_ids_list = [item["response_ids"] for item in batch]
 
-        # Pad each component separately
-        context_ids = pad_sequence(
-            context_ids_list, batch_first=True, padding_value=self.pad_token_id
-        )
-        prompt_ids = pad_sequence(
-            prompt_ids_list, batch_first=True, padding_value=self.pad_token_id
-        )
-        response_ids = pad_sequence(
-            response_ids_list, batch_first=True, padding_value=self.pad_token_id
-        )
+        # Pad each component (fixed length ensures uniform GPU memory in DDP)
+        context_ids = self._pad(context_ids_list, self.max_context_length)
+        prompt_ids = self._pad(prompt_ids_list, self.max_prompt_length)
+        response_ids = self._pad(response_ids_list, self.max_response_length)
 
         context_mask = (context_ids != self.pad_token_id).long()
         prompt_mask = (prompt_ids != self.pad_token_id).long()

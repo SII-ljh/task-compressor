@@ -149,7 +149,12 @@ def main():
         max_prompt_length=config.data.max_prompt_length,
         max_response_length=config.data.max_response_length,
     )
-    collator = QACollator(pad_token_id=tokenizer.pad_token_id)
+    collator = QACollator(
+        pad_token_id=tokenizer.pad_token_id,
+        max_context_length=config.data.max_context_length,
+        max_prompt_length=config.data.max_prompt_length,
+        max_response_length=config.data.max_response_length,
+    )
 
     logger.info(f"  Train: {len(train_dataset)} samples")
     logger.info(f"  Dev:   {len(dev_dataset)} samples")
