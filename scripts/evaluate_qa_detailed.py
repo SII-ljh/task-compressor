@@ -327,10 +327,54 @@ def infer_config_from_checkpoint(ckpt_dir: Path) -> Tuple[int, int]:
     return n_prompt, n_context
 
 
+def _is_checkpoint_dir(d: Path) -> bool:
+    """Check if a directory contains a valid checkpoint."""
+    return (
+        (d / "task_compressor_modules.pt").exists()
+        and (d / "lora_adapter").is_dir()
+    )
+
+
+def _pick_best_checkpoint(exp_dir: Path) -> Optional[Path]:
+    """From an experiment directory, pick the best checkpoint.
+
+    Priority: best > final > highest step number.
+    """
+    best = exp_dir / "best"
+    if _is_checkpoint_dir(best):
+        return best
+
+    final = exp_dir / "final"
+    if _is_checkpoint_dir(final):
+        return final
+
+    # Fall back to highest step_XXXX
+    step_dirs = []
+    for d in exp_dir.iterdir():
+        if not d.is_dir():
+            continue
+        m = re.match(r"step_(\d+)", d.name)
+        if m and _is_checkpoint_dir(d):
+            step_dirs.append((int(m.group(1)), d))
+
+    if step_dirs:
+        step_dirs.sort(key=lambda x: x[0], reverse=True)
+        return step_dirs[0][1]
+
+    # Maybe the exp_dir itself is a checkpoint dir (user passed it directly)
+    if _is_checkpoint_dir(exp_dir):
+        return exp_dir
+
+    return None
+
+
 def discover_checkpoints(
     base_dir: str = "outputs",
 ) -> List[Tuple[Path, int, int, int]]:
-    """Recursively find checkpoint directories under base_dir.
+    """Find experiment directories under base_dir, pick best checkpoint each.
+
+    Scans for directories containing checkpoint sub-dirs (best/, final/,
+    step_XXXX/). For each experiment, selects best > final > latest step.
 
     Returns list of (checkpoint_dir, n_prompt, n_context, k) sorted by k.
     """
@@ -338,11 +382,22 @@ def discover_checkpoints(
     if not base.exists():
         return []
 
-    found = []
+    # Collect all directories that contain task_compressor_modules.pt
+    # and group them by their parent experiment directory.
+    experiment_dirs: Dict[Path, List[Path]] = {}
     for modules_file in base.rglob("task_compressor_modules.pt"):
         ckpt_dir = modules_file.parent
-        # Must also have lora_adapter
         if not (ckpt_dir / "lora_adapter").is_dir():
+            continue
+        # The experiment dir is the parent of the checkpoint tag dir
+        # e.g., outputs/ablation/k64_np16_nc48/best -> experiment = k64_np16_nc48
+        exp_dir = ckpt_dir.parent
+        experiment_dirs.setdefault(exp_dir, []).append(ckpt_dir)
+
+    found = []
+    for exp_dir in experiment_dirs:
+        ckpt_dir = _pick_best_checkpoint(exp_dir)
+        if ckpt_dir is None:
             continue
 
         try:
@@ -1244,10 +1299,21 @@ def main():
         entries = []
         for p in args.checkpoints.split(","):
             p = p.strip()
-            ckpt_dir = Path(p)
-            if not (ckpt_dir / "task_compressor_modules.pt").exists():
-                logger.warning(f"No task_compressor_modules.pt in {p}, skipping")
-                continue
+            candidate = Path(p)
+
+            # If user passed a checkpoint tag dir directly (has modules.pt)
+            if _is_checkpoint_dir(candidate):
+                ckpt_dir = candidate
+            else:
+                # Try it as an experiment dir: pick best/final/step_*
+                ckpt_dir = _pick_best_checkpoint(candidate)
+                if ckpt_dir is None:
+                    logger.warning(
+                        f"No valid checkpoint in {p}, skipping "
+                        f"(expected best/, final/, or step_*/ sub-dir)"
+                    )
+                    continue
+
             try:
                 n_p, n_c = infer_config_from_checkpoint(ckpt_dir)
             except Exception as e:
