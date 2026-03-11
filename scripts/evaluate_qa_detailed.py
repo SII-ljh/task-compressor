@@ -469,28 +469,32 @@ def evaluate_qa_detailed(
 
         # Move tensors to device
         batch = {k: v.to(accelerator.device) for k, v in batch.items()}
+        device_type = accelerator.device.type
+        use_amp = device_type == "cuda"
 
         # ── Teacher-forcing loss ──
-        outputs = unwrapped(
-            context_ids=batch["context_ids"],
-            context_mask=batch["context_mask"],
-            prompt_ids=batch["prompt_ids"],
-            prompt_mask=batch["prompt_mask"],
-            response_ids=batch["response_ids"],
-            response_mask=batch["response_mask"],
-        )
+        with torch.amp.autocast(device_type, dtype=torch.bfloat16, enabled=use_amp):
+            outputs = unwrapped(
+                context_ids=batch["context_ids"],
+                context_mask=batch["context_mask"],
+                prompt_ids=batch["prompt_ids"],
+                prompt_mask=batch["prompt_mask"],
+                response_ids=batch["response_ids"],
+                response_mask=batch["response_mask"],
+            )
         batch_loss = outputs["qa_loss"].float().item()
 
         # ── Generation ──
-        encoder_hidden = unwrapped.encode(
-            batch["context_ids"], batch["context_mask"]
-        )
-        compressed = unwrapped.compress(
-            encoder_hidden,
-            batch["context_mask"],
-            batch["prompt_ids"],
-            batch["prompt_mask"],
-        )
+        with torch.amp.autocast(device_type, dtype=torch.bfloat16, enabled=use_amp):
+            encoder_hidden = unwrapped.encode(
+                batch["context_ids"], batch["context_mask"]
+            )
+            compressed = unwrapped.compress(
+                encoder_hidden,
+                batch["context_mask"],
+                batch["prompt_ids"],
+                batch["prompt_mask"],
+            )
         gen_ids = unwrapped.generate(
             compressed,
             batch["prompt_ids"],
