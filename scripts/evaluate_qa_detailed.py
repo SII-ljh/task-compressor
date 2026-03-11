@@ -4,28 +4,38 @@
 Auto-discovers checkpoint directories under outputs/, loads each model,
 evaluates on both held-out dev set and a sample from the training set.
 
+Each checkpoint's own config.yaml (saved by trainer) is used automatically.
+No --config flag needed for checkpoints trained with the latest trainer.
+
 - **stdout**: summary statistics (comparison table, bar charts, ranking)
 - **markdown report**: full per-sample analysis saved to results/qa_eval_report.md
 
 Usage:
-    # Auto-discover all experiments under outputs/
-    python scripts/evaluate_qa_detailed.py --config configs/h200_base.yaml
-
-    # Only under a specific subdirectory
-    python scripts/evaluate_qa_detailed.py --config configs/h200_base.yaml \
+    # Auto-discover all experiments (config loaded from each checkpoint)
+    python scripts/evaluate_qa_detailed.py \
         --outputs_dir outputs/ablation_compression
 
-    # Specific checkpoints
-    python scripts/evaluate_qa_detailed.py --config configs/h200_base.yaml \
-        --checkpoints outputs/ablation_compression/k512_np128_nc384/best,outputs/ablation_compression/k64_np16_nc48/best
+    # Specific experiments (just pass the experiment dirs)
+    python scripts/evaluate_qa_detailed.py \
+        --checkpoints outputs/ablation_compression/k512_np128_nc384,outputs/ablation_compression/k16_np4_nc12
 
-    # Full dev set
-    python scripts/evaluate_qa_detailed.py --config configs/h200_base.yaml \
-        --max_eval_samples 0
+    # Full dev set + export
+    python scripts/evaluate_qa_detailed.py \
+        --outputs_dir outputs/ablation_compression \
+        --max_eval_samples 0 --csv results/metrics.csv
 
-    # Multi-GPU (via accelerate)
+    # Skip baseline (raw Qwen) evaluation
+    python scripts/evaluate_qa_detailed.py \
+        --outputs_dir outputs/ablation_compression --no_baselines
+
+    # Old checkpoints without config.yaml: provide fallback config
+    python scripts/evaluate_qa_detailed.py \
+        --outputs_dir outputs/ablation_compression \
+        --config configs/h200_base.yaml
+
+    # Multi-GPU
     accelerate launch --multi_gpu --num_processes 4 \
-        scripts/evaluate_qa_detailed.py --config configs/h200_base.yaml
+        scripts/evaluate_qa_detailed.py --outputs_dir outputs/ablation_compression
 """
 
 import argparse
@@ -417,6 +427,14 @@ def discover_checkpoints(
 # ── Model loading ────────────────────────────────────────────────────────────
 
 
+def load_config_from_checkpoint(ckpt_dir: Path) -> Optional[Config]:
+    """Try to load config.yaml saved alongside the checkpoint."""
+    config_path = ckpt_dir / "config.yaml"
+    if config_path.exists():
+        return Config.from_yaml(str(config_path))
+    return None
+
+
 def load_model(
     checkpoint_dir: Path,
     base_config: Config,
@@ -424,12 +442,24 @@ def load_model(
     n_context_tokens: int,
     accelerator: Accelerator,
 ) -> TaskCompressorModel:
-    """Load a Task Compressor model from checkpoint."""
-    # Clone the base config and override prompt/context tokens
-    import copy
-    config = copy.deepcopy(base_config)
-    config.model.n_prompt_tokens = n_prompt_tokens
-    config.model.n_context_tokens = n_context_tokens
+    """Load a Task Compressor model from checkpoint.
+
+    If checkpoint contains config.yaml (saved by trainer), uses that.
+    Otherwise falls back to base_config with n_p/n_c overrides.
+    """
+    ckpt_config = load_config_from_checkpoint(checkpoint_dir)
+    if ckpt_config is not None:
+        config = ckpt_config
+        logger.info(f"  Loaded config.yaml from checkpoint")
+    else:
+        import copy
+        config = copy.deepcopy(base_config)
+        config.model.n_prompt_tokens = n_prompt_tokens
+        config.model.n_context_tokens = n_context_tokens
+        logger.info(
+            f"  No config.yaml in checkpoint, using base config "
+            f"with n_p={n_prompt_tokens}, n_c={n_context_tokens}"
+        )
 
     torch_dtype = torch.bfloat16 if config.training.bf16 else torch.float32
     model = TaskCompressorModel(config.model, torch_dtype=torch_dtype)
@@ -1197,8 +1227,9 @@ def main():
     parser.add_argument(
         "--config",
         type=str,
-        default="configs/h200_base.yaml",
-        help="Base config YAML (for shared params like base_model, data paths)",
+        default=None,
+        help="Fallback config YAML. Not needed if checkpoints contain config.yaml "
+        "(saved by trainer >= v2). Only used for old checkpoints missing config.yaml.",
     )
     parser.add_argument(
         "--eval_data",
@@ -1285,14 +1316,8 @@ def main():
     )
     args = parser.parse_args()
 
-    # ── Load base config ──
-    base_config = Config.from_yaml(args.config)
-    eval_data = args.eval_data or base_config.data.dev_file
-    train_data = args.train_data or base_config.data.train_file
-
-    # Stash resolved data paths on args for report
-    args.eval_data = eval_data
-    args.train_data = train_data
+    # ── Load fallback base config (optional) ──
+    base_config = Config.from_yaml(args.config) if args.config else None
 
     # ── Discover checkpoints ──
     if args.checkpoints:
@@ -1330,6 +1355,23 @@ def main():
         )
         return
 
+    # ── Resolve a reference config (for tokenizer, data paths, etc.) ──
+    # Try first checkpoint's saved config, then fallback to --config
+    ref_config = load_config_from_checkpoint(entries[0][0])
+    if ref_config is None:
+        ref_config = base_config
+    if ref_config is None:
+        logger.error(
+            "Cannot determine config. Either use checkpoints that contain "
+            "config.yaml (saved by latest trainer), or pass --config."
+        )
+        return
+
+    eval_data = args.eval_data or ref_config.data.dev_file
+    train_data = args.train_data or ref_config.data.train_file
+    args.eval_data = eval_data
+    args.train_data = train_data
+
     # ── Initialize ──
     accelerator = Accelerator()
     is_main = accelerator.is_main_process
@@ -1350,7 +1392,8 @@ def main():
                 f"  Baselines:   {len(baseline_models)}  "
                 f"({', '.join(n for _, n in baseline_models)})"
             )
-        print(f"  Base config: {args.config}")
+        config_src = "checkpoint config.yaml" if base_config is None else args.config
+        print(f"  Config src:  {config_src}")
         print(f"  Dev data:    {eval_data}")
         print(
             f"  Dev samples: "
@@ -1363,16 +1406,16 @@ def main():
 
     # ── Load tokenizer ──
     tokenizer = AutoTokenizer.from_pretrained(
-        base_config.model.base_model, trust_remote_code=True
+        ref_config.model.base_model, trust_remote_code=True
     )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
 
     # ── Shared data params ──
-    max_ctx = base_config.data.max_context_length
-    max_prompt = base_config.data.max_prompt_length
-    max_resp = base_config.data.max_response_length
+    max_ctx = ref_config.data.max_context_length
+    max_prompt = ref_config.data.max_prompt_length
+    max_resp = ref_config.data.max_response_length
 
     # ── Evaluate each model ──
     all_results: List[ModelResult] = []
@@ -1535,8 +1578,9 @@ def main():
             print(f"  {BOLD}k={k}{RESET}  ({config_info})  [{ckpt_dir}]")
             print(f"  Loading model...")
 
+        fallback_config = base_config if base_config is not None else ref_config
         model = load_model(
-            ckpt_dir, base_config, n_p, n_c, accelerator
+            ckpt_dir, fallback_config, n_p, n_c, accelerator
         )
 
         collator = EvalQACollator(

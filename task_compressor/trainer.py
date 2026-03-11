@@ -479,4 +479,10 @@ class Trainer:
             },
             ckpt_dir / "training_state.pt",
         )
+
+        # Save config so evaluation can load it without --config
+        import yaml
+        with open(ckpt_dir / "config.yaml", "w") as f:
+            yaml.dump(self.config.to_dict(), f, default_flow_style=False)
+
         logger.info(f"Checkpoint saved to {ckpt_dir}")
