@@ -147,13 +147,18 @@ class TaskCompressorModel(nn.Module):
             (B, L_c, D) last hidden states.
         """
         self.base_model.enable_adapter_layers()
-        outputs = self.base_model(
+        # Call the inner transformer (QwenModel) directly to get
+        # last_hidden_state.  Going through the CausalLM wrapper requires
+        # output_hidden_states=True which forces ALL intermediate layer
+        # outputs to persist in memory — defeating gradient checkpointing
+        # and wasting ~7 GB for a 0.6B model (B=32, L=4096).
+        causal_lm = self.base_model.get_base_model()
+        outputs = causal_lm.model(
             input_ids=context_ids,
             attention_mask=context_mask,
-            output_hidden_states=True,
             return_dict=True,
         )
-        return outputs.hidden_states[-1]
+        return outputs.last_hidden_state
 
     def compress(
         self,
@@ -234,6 +239,10 @@ class TaskCompressorModel(nn.Module):
 
         Input sequence: [compressed (k) | sep (1) | prompt (L_p) | response (L_t)]
 
+        To save VRAM, we call the inner transformer to get hidden states
+        then apply lm_head **only** to response-relevant positions, avoiding
+        the full (B, total_len, V) logit tensor.
+
         Gradient checkpointing is temporarily disabled during decode because
         the LoRA adapter toggle changes the computation graph.  Checkpointing
         recomputation would see the wrong adapter state, producing shape
@@ -261,38 +270,38 @@ class TaskCompressorModel(nn.Module):
             [prefix_mask, prompt_mask, response_mask], dim=1
         )
 
-        # Decoder forward in bf16.  Earlier NaN issues were root-caused to
-        # (1) Perceiver output scale mismatch and (2) bf16 optimizer states,
-        # both now fixed.  Loss is computed in fp32 downstream.
-        outputs = self.base_model(
+        L_p = prompt_ids.shape[1]
+        L_t = response_ids.shape[1]
+        prefix_len = k + 1 + L_p
+
+        # Use inner transformer to get hidden states, then apply lm_head
+        # only to response-relevant positions.  This avoids materializing
+        # the full (B, total_len, V) logit tensor — saving ~50% decode VRAM.
+        causal_lm = self.base_model.get_base_model()
+        outputs = causal_lm.model(
             inputs_embeds=inputs_embeds,
             attention_mask=attn_mask,
             return_dict=True,
         )
-        logits = outputs.logits  # (B, total_len, V)
+        last_hidden = outputs.last_hidden_state  # (B, total_len, D)
 
-        # Build labels: only compute loss on response tokens
-        L_p = prompt_ids.shape[1]
-        L_t = response_ids.shape[1]
-        prefix_len = k + 1 + L_p
-        total_len = inputs_embeds.shape[1]
+        # Logits at positions [prefix_len-1, prefix_len+L_t-1) predict
+        # tokens at positions [prefix_len, prefix_len+L_t), i.e. response_ids.
+        # This pre-applies the causal shift so no shift is needed in loss.
+        relevant_hidden = last_hidden[:, prefix_len - 1 : prefix_len + L_t - 1, :]
+        logits = causal_lm.lm_head(relevant_hidden)  # (B, L_t, V)
 
-        labels = torch.full(
-            (B, total_len), -100, dtype=torch.long, device=device
-        )
-        labels[:, prefix_len: prefix_len + L_t] = response_ids
-        # Mask padding positions in response
-        pad_positions = response_mask == 0
-        labels[:, prefix_len: prefix_len + L_t][pad_positions] = -100
+        # Labels: response_ids with padding masked to -100
+        labels = response_ids.clone()
+        labels[response_mask == 0] = -100
 
         # Re-enable adapter forward so subsequent calls (e.g. encode) work
         self._enable_adapter_forward_only()
         self._resume_gradient_checkpointing(gc_was_on)
 
         return {
-            "logits": logits,
-            "labels": labels,
-            "prefix_len": prefix_len,
+            "logits": logits,   # (B, L_t, V) — response positions only
+            "labels": labels,   # (B, L_t)
         }
 
     def forward(
@@ -316,19 +325,18 @@ class TaskCompressorModel(nn.Module):
             encoder_hidden, context_mask, prompt_ids, prompt_mask
         )
 
-        # 3. Student decode
+        # 3. Student decode (returns response-only logits & labels)
         dec_out = self.decode_train(
             compressed, prompt_ids, prompt_mask, response_ids, response_mask
         )
-        student_logits = dec_out["logits"]
-        labels = dec_out["labels"]
+        logits = dec_out["logits"]    # (B, L_t, V) — response positions only
+        labels = dec_out["labels"]    # (B, L_t)
 
         # 4. QA loss (CE on response tokens, fp32 for numerical safety)
-        shift_logits = student_logits[:, :-1, :].contiguous().float()
-        shift_labels = labels[:, 1:].contiguous()
+        # logits[:, i, :] predicts labels[:, i] — already aligned, no shift
         qa_loss = F.cross_entropy(
-            shift_logits.view(-1, shift_logits.shape[-1]),
-            shift_labels.view(-1),
+            logits.float().reshape(-1, logits.shape[-1]),
+            labels.reshape(-1),
             ignore_index=-100,
         )
 
