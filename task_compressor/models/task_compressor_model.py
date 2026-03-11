@@ -237,8 +237,7 @@ class TaskCompressorModel(nn.Module):
         Gradient checkpointing is temporarily disabled during decode because
         the LoRA adapter toggle changes the computation graph.  Checkpointing
         recomputation would see the wrong adapter state, producing shape
-        mismatches.  The decode sequence is typically much shorter than the
-        encode context, so the memory cost is acceptable.
+        mismatches.
         """
         gc_was_on = self._pause_gradient_checkpointing()
         self._disable_adapter_forward_only()
@@ -262,16 +261,14 @@ class TaskCompressorModel(nn.Module):
             [prefix_mask, prompt_mask, response_mask], dim=1
         )
 
-        # Decoder forward in fp32: backward through many transformer layers
-        # loses precision in bf16, causing NaN gradients.  Use autocast with
-        # dtype=float32 (not enabled=False) so Linear layers auto-promote
-        # their bf16 weights to fp32.
-        with torch.amp.autocast(device_type=device.type, dtype=torch.float32):
-            outputs = self.base_model(
-                inputs_embeds=inputs_embeds.float(),
-                attention_mask=attn_mask,
-                return_dict=True,
-            )
+        # Decoder forward in bf16.  Earlier NaN issues were root-caused to
+        # (1) Perceiver output scale mismatch and (2) bf16 optimizer states,
+        # both now fixed.  Loss is computed in fp32 downstream.
+        outputs = self.base_model(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attn_mask,
+            return_dict=True,
+        )
         logits = outputs.logits  # (B, total_len, V)
 
         # Build labels: only compute loss on response tokens
