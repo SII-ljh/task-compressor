@@ -252,16 +252,11 @@ class TaskCompressorModel(nn.Module):
         then apply lm_head **only** to response-relevant positions, avoiding
         the full (B, total_len, V) logit tensor.
 
-        When LoRA is active, gradient checkpointing is temporarily disabled
-        during decode because the adapter toggle changes the computation
-        graph.  When LoRA is off (rank=0), no toggle occurs so checkpointing
-        stays on.
+        Caller (``forward()``) is responsible for toggling LoRA OFF before
+        calling this method.  Gradient checkpointing stays ON; a backward
+        hook on ``encoder_hidden`` ensures encode layers recompute with
+        LoRA ON while decode layers recompute with LoRA OFF.
         """
-        gc_was_on = False
-        if self._has_lora:
-            gc_was_on = self._pause_gradient_checkpointing()
-            self._disable_adapter_forward_only()
-
         B = compressed.shape[0]
         device = compressed.device
         k = compressed.shape[1]
@@ -307,11 +302,6 @@ class TaskCompressorModel(nn.Module):
         labels = response_ids.clone()
         labels[response_mask == 0] = -100
 
-        # Re-enable adapter forward so subsequent calls (e.g. encode) work
-        if self._has_lora:
-            self._enable_adapter_forward_only()
-            self._resume_gradient_checkpointing(gc_was_on)
-
         return {
             "logits": logits,   # (B, L_t, V) — response positions only
             "labels": labels,   # (B, L_t)
@@ -338,14 +328,24 @@ class TaskCompressorModel(nn.Module):
             encoder_hidden, context_mask, prompt_ids, prompt_mask
         )
 
-        # 3. Student decode (returns response-only logits & labels)
+        # 3. Disable LoRA for frozen-decoder pass (grad-ckpt stays ON).
+        #    A backward hook on encoder_hidden re-enables LoRA before
+        #    encode layers are recomputed, keeping each direction correct.
+        if self._has_lora:
+            self._disable_adapter_forward_only()
+            if encoder_hidden.requires_grad:
+                encoder_hidden.register_hook(
+                    lambda grad: self._enable_adapter_forward_only() or grad
+                )
+
+        # 4. Student decode (returns response-only logits & labels)
         dec_out = self.decode_train(
             compressed, prompt_ids, prompt_mask, response_ids, response_mask
         )
         logits = dec_out["logits"]    # (B, L_t, V) — response positions only
         labels = dec_out["labels"]    # (B, L_t)
 
-        # 4. QA loss (CE on response tokens, fp32 for numerical safety)
+        # 5. QA loss (CE on response tokens, fp32 for numerical safety)
         # logits[:, i, :] predicts labels[:, i] — already aligned, no shift
         qa_loss = F.cross_entropy(
             logits.float().reshape(-1, logits.shape[-1]),
