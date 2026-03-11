@@ -80,6 +80,25 @@ for K in "${SELECTED_K[@]}"; do
     echo "  Output: ${OUTPUT_DIR}"
     echo "────────────────────────────────────────────────────────────────"
 
+    # Generate per-experiment config YAML (so evaluate_qa_detailed.py can find it)
+    EXP_CONFIG="configs/${RUN_NAME}.yaml"
+    if [ ! -f "${EXP_CONFIG}" ]; then
+        python3 -c "
+import yaml
+with open('${CONFIG}') as f:
+    cfg = yaml.safe_load(f)
+cfg['model']['n_prompt_tokens'] = ${NP}
+cfg['model']['n_context_tokens'] = ${NC}
+cfg['training']['per_gpu_batch_size'] = ${BS}
+cfg['training']['gradient_accumulation_steps'] = ${GA}
+cfg['output_dir'] = '${OUTPUT_DIR}'
+cfg['wandb_run_name'] = '${RUN_NAME}'
+with open('${EXP_CONFIG}', 'w') as f:
+    yaml.dump(cfg, f, default_flow_style=False)
+"
+        echo "  → Generated ${EXP_CONFIG}"
+    fi
+
     # Skip if final checkpoint already exists
     if [ -d "${OUTPUT_DIR}/final" ]; then
         echo "  → SKIPPING: final checkpoint already exists"
@@ -88,13 +107,7 @@ for K in "${SELECTED_K[@]}"; do
     fi
 
     if torchrun --nproc_per_node=${NUM_GPUS} \
-        scripts/train.py --config ${CONFIG} \
-        model.n_prompt_tokens=${NP} \
-        model.n_context_tokens=${NC} \
-        training.per_gpu_batch_size=${BS} \
-        training.gradient_accumulation_steps=${GA} \
-        output_dir="${OUTPUT_DIR}" \
-        wandb_run_name="${RUN_NAME}"; then
+        scripts/train.py --config ${EXP_CONFIG} ; then
         echo "  → PASSED: k=${K}"
         PASSED+=("k=${K}")
     else

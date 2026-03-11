@@ -1,21 +1,19 @@
 #!/usr/bin/env python3
 """Detailed QA evaluation across all Task Compressor experiments.
 
-Auto-discovers checkpoint directories under outputs/, loads each model,
-evaluates on both held-out dev set and a sample from the training set.
-
-Each checkpoint's own config.yaml (saved by trainer) is used automatically.
-No --config flag needed for checkpoints trained with the latest trainer.
+Auto-discovers experiment directories under outputs/, matches each to its
+config YAML via ``configs/{experiment_name}.yaml`` (same convention as
+deep_compressor), loads the model, and evaluates on dev + train peek.
 
 - **stdout**: summary statistics (comparison table, bar charts, ranking)
 - **markdown report**: full per-sample analysis saved to results/qa_eval_report.md
 
 Usage:
-    # Auto-discover all experiments (config loaded from each checkpoint)
+    # Auto-discover all experiments under a directory
     python scripts/evaluate_qa_detailed.py \
         --outputs_dir outputs/ablation_compression
 
-    # Specific experiments (just pass the experiment dirs)
+    # Specific experiments (comma-separated experiment dirs)
     python scripts/evaluate_qa_detailed.py \
         --checkpoints outputs/ablation_compression/k512_np128_nc384,outputs/ablation_compression/k16_np4_nc12
 
@@ -27,11 +25,6 @@ Usage:
     # Skip baseline (raw Qwen) evaluation
     python scripts/evaluate_qa_detailed.py \
         --outputs_dir outputs/ablation_compression --no_baselines
-
-    # Old checkpoints without config.yaml: provide fallback config
-    python scripts/evaluate_qa_detailed.py \
-        --outputs_dir outputs/ablation_compression \
-        --config configs/h200_base.yaml
 
     # Multi-GPU
     accelerate launch --multi_gpu --num_processes 4 \
@@ -319,44 +312,15 @@ class EvalQACollator:
 # ── Checkpoint discovery ─────────────────────────────────────────────────────
 
 
-def infer_config_from_checkpoint(ckpt_dir: Path) -> Tuple[int, int]:
-    """Infer n_prompt_tokens and n_context_tokens from checkpoint weights.
-
-    Returns:
-        (n_prompt_tokens, n_context_tokens)
-    """
-    modules_path = ckpt_dir / "task_compressor_modules.pt"
-    state = torch.load(modules_path, map_location="cpu", weights_only=True)
-
-    n_context = state["context_tokens"].shape[0]
-    n_prompt = 0
-    for key in state:
-        if "latent_tokens" in key:
-            n_prompt = state[key].shape[0]
-            break
-    return n_prompt, n_context
-
-
-def _is_checkpoint_dir(d: Path) -> bool:
-    """Check if a directory contains a valid checkpoint."""
-    return (
-        (d / "task_compressor_modules.pt").exists()
-        and (d / "lora_adapter").is_dir()
-    )
-
-
 def _pick_best_checkpoint(exp_dir: Path) -> Optional[Path]:
     """From an experiment directory, pick the best checkpoint.
 
     Priority: best > final > highest step number.
     """
-    best = exp_dir / "best"
-    if _is_checkpoint_dir(best):
-        return best
-
-    final = exp_dir / "final"
-    if _is_checkpoint_dir(final):
-        return final
+    for tag in ("best", "final"):
+        d = exp_dir / tag
+        if (d / "task_compressor_modules.pt").exists() and (d / "lora_adapter").is_dir():
+            return d
 
     # Fall back to highest step_XXXX
     step_dirs = []
@@ -364,103 +328,63 @@ def _pick_best_checkpoint(exp_dir: Path) -> Optional[Path]:
         if not d.is_dir():
             continue
         m = re.match(r"step_(\d+)", d.name)
-        if m and _is_checkpoint_dir(d):
+        if m and (d / "task_compressor_modules.pt").exists():
             step_dirs.append((int(m.group(1)), d))
 
     if step_dirs:
         step_dirs.sort(key=lambda x: x[0], reverse=True)
         return step_dirs[0][1]
 
-    # Maybe the exp_dir itself is a checkpoint dir (user passed it directly)
-    if _is_checkpoint_dir(exp_dir):
-        return exp_dir
-
     return None
 
 
 def discover_checkpoints(
     base_dir: str = "outputs",
-) -> List[Tuple[Path, int, int, int]]:
-    """Find experiment directories under base_dir, pick best checkpoint each.
+) -> List[Tuple[Path, Path, int]]:
+    """Return (checkpoint_dir, config_path, k_value) sorted by k.
 
-    Scans for directories containing checkpoint sub-dirs (best/, final/,
-    step_XXXX/). For each experiment, selects best > final > latest step.
-
-    Returns list of (checkpoint_dir, n_prompt, n_context, k) sorted by k.
+    Follows deep_compressor convention:
+      - Scan experiment directories under base_dir
+      - Match each to ``configs/{experiment_name}.yaml``
+      - Pick best > final > latest step checkpoint
     """
     base = Path(base_dir)
     if not base.exists():
         return []
 
-    # Collect all directories that contain task_compressor_modules.pt
-    # and group them by their parent experiment directory.
-    experiment_dirs: Dict[Path, List[Path]] = {}
-    for modules_file in base.rglob("task_compressor_modules.pt"):
-        ckpt_dir = modules_file.parent
-        if not (ckpt_dir / "lora_adapter").is_dir():
-            continue
-        # The experiment dir is the parent of the checkpoint tag dir
-        # e.g., outputs/ablation/k64_np16_nc48/best -> experiment = k64_np16_nc48
-        exp_dir = ckpt_dir.parent
-        experiment_dirs.setdefault(exp_dir, []).append(ckpt_dir)
-
     found = []
-    for exp_dir in experiment_dirs:
+    for exp_dir in sorted(base.iterdir()):
+        if not exp_dir.is_dir():
+            continue
+
         ckpt_dir = _pick_best_checkpoint(exp_dir)
         if ckpt_dir is None:
             continue
 
-        try:
-            n_p, n_c = infer_config_from_checkpoint(ckpt_dir)
-        except Exception as e:
-            logger.warning(f"Cannot infer config from {ckpt_dir}: {e}")
+        name = exp_dir.name
+        config_path = Path("configs") / f"{name}.yaml"
+        if not config_path.exists():
+            logger.warning(f"No config for {name} (expected {config_path}), skipping")
             continue
 
-        k = n_p + n_c
-        found.append((ckpt_dir, n_p, n_c, k))
+        # Parse k value from directory name (k64_np16_nc48 → k=64)
+        m = re.search(r"k(\d+)", name)
+        k_value = int(m.group(1)) if m else -1
+        found.append((ckpt_dir, config_path, k_value))
 
-    # Sort by k value, then by path for stable ordering
-    found.sort(key=lambda x: (x[3], str(x[0])))
+    found.sort(key=lambda x: x[2])
     return found
 
 
 # ── Model loading ────────────────────────────────────────────────────────────
 
 
-def load_config_from_checkpoint(ckpt_dir: Path) -> Optional[Config]:
-    """Try to load config.yaml saved alongside the checkpoint."""
-    config_path = ckpt_dir / "config.yaml"
-    if config_path.exists():
-        return Config.from_yaml(str(config_path))
-    return None
-
-
 def load_model(
     checkpoint_dir: Path,
-    base_config: Config,
-    n_prompt_tokens: int,
-    n_context_tokens: int,
+    config: Config,
     accelerator: Accelerator,
 ) -> TaskCompressorModel:
-    """Load a Task Compressor model from checkpoint.
-
-    If checkpoint contains config.yaml (saved by trainer), uses that.
-    Otherwise falls back to base_config with n_p/n_c overrides.
-    """
-    ckpt_config = load_config_from_checkpoint(checkpoint_dir)
-    if ckpt_config is not None:
-        config = ckpt_config
-        logger.info(f"  Loaded config.yaml from checkpoint")
-    else:
-        import copy
-        config = copy.deepcopy(base_config)
-        config.model.n_prompt_tokens = n_prompt_tokens
-        config.model.n_context_tokens = n_context_tokens
-        logger.info(
-            f"  No config.yaml in checkpoint, using base config "
-            f"with n_p={n_prompt_tokens}, n_c={n_context_tokens}"
-        )
-
+    """Load a Task Compressor model from checkpoint + config."""
     torch_dtype = torch.bfloat16 if config.training.bf16 else torch.float32
     model = TaskCompressorModel(config.model, torch_dtype=torch_dtype)
 
@@ -966,7 +890,7 @@ def write_markdown_report(
         if args:
             f.write("## Evaluation Config\n\n")
             f.write("| Parameter | Value |\n|---|---|\n")
-            f.write(f"| Base config | `{args.config}` |\n")
+            f.write(f"| Config convention | `configs/{{experiment_name}}.yaml` |\n")
             f.write(f"| Dev data | `{args.eval_data}` |\n")
             f.write(f"| Train data | `{args.train_data}` |\n")
             f.write(
@@ -1225,13 +1149,6 @@ def main():
         description="Detailed QA evaluation across all Task Compressor experiments"
     )
     parser.add_argument(
-        "--config",
-        type=str,
-        default=None,
-        help="Fallback config YAML. Not needed if checkpoints contain config.yaml "
-        "(saved by trainer >= v2). Only used for old checkpoints missing config.yaml.",
-    )
-    parser.add_argument(
         "--eval_data",
         type=str,
         default=None,
@@ -1316,57 +1233,49 @@ def main():
     )
     args = parser.parse_args()
 
-    # ── Load fallback base config (optional) ──
-    base_config = Config.from_yaml(args.config) if args.config else None
-
     # ── Discover checkpoints ──
+    # Convention: configs/{experiment_name}.yaml (same as deep_compressor)
     if args.checkpoints:
         entries = []
         for p in args.checkpoints.split(","):
             p = p.strip()
-            candidate = Path(p)
+            exp_dir = Path(p)
 
-            # If user passed a checkpoint tag dir directly (has modules.pt)
-            if _is_checkpoint_dir(candidate):
-                ckpt_dir = candidate
-            else:
-                # Try it as an experiment dir: pick best/final/step_*
-                ckpt_dir = _pick_best_checkpoint(candidate)
-                if ckpt_dir is None:
-                    logger.warning(
-                        f"No valid checkpoint in {p}, skipping "
-                        f"(expected best/, final/, or step_*/ sub-dir)"
-                    )
+            # Pick best checkpoint within the experiment dir
+            ckpt_dir = _pick_best_checkpoint(exp_dir)
+            if ckpt_dir is None:
+                # Maybe user passed the checkpoint tag dir directly
+                if (exp_dir / "task_compressor_modules.pt").exists():
+                    ckpt_dir = exp_dir
+                    exp_dir = ckpt_dir.parent
+                else:
+                    logger.warning(f"No checkpoint in {p}, skipping")
                     continue
 
-            try:
-                n_p, n_c = infer_config_from_checkpoint(ckpt_dir)
-            except Exception as e:
-                logger.warning(f"Cannot infer config from {ckpt_dir}: {e}")
+            name = exp_dir.name
+            config_path = Path("configs") / f"{name}.yaml"
+            if not config_path.exists():
+                logger.warning(f"No config for {name} (expected {config_path}), skipping")
                 continue
-            entries.append((ckpt_dir, n_p, n_c, n_p + n_c))
-        entries.sort(key=lambda x: (x[3], str(x[0])))
+
+            m = re.search(r"k(\d+)", name)
+            k_value = int(m.group(1)) if m else -1
+            entries.append((ckpt_dir, config_path, k_value))
+        entries.sort(key=lambda x: x[2])
     else:
         entries = discover_checkpoints(args.outputs_dir)
 
     if not entries:
         logger.error(
-            "No checkpoints found. Train some models first, or use --checkpoints."
+            "No checkpoints found. Make sure:\n"
+            "  1. Experiment dirs exist under --outputs_dir\n"
+            "  2. Each has a matching configs/{name}.yaml\n"
+            "  3. Each has best/, final/, or step_*/ with checkpoint files"
         )
         return
 
-    # ── Resolve a reference config (for tokenizer, data paths, etc.) ──
-    # Try first checkpoint's saved config, then fallback to --config
-    ref_config = load_config_from_checkpoint(entries[0][0])
-    if ref_config is None:
-        ref_config = base_config
-    if ref_config is None:
-        logger.error(
-            "Cannot determine config. Either use checkpoints that contain "
-            "config.yaml (saved by latest trainer), or pass --config."
-        )
-        return
-
+    # ── Load reference config (first experiment, for tokenizer & data paths) ──
+    ref_config = Config.from_yaml(str(entries[0][1]))
     eval_data = args.eval_data or ref_config.data.dev_file
     train_data = args.train_data or ref_config.data.train_file
     args.eval_data = eval_data
@@ -1385,15 +1294,13 @@ def main():
         print(f"{'=' * W}")
         print(
             f"  Compressed:  {len(entries)}  "
-            f"({', '.join(f'k={k}' for _, _, _, k in entries)})"
+            f"({', '.join(f'k={k}' for _, _, k in entries)})"
         )
         if baseline_models:
             print(
                 f"  Baselines:   {len(baseline_models)}  "
                 f"({', '.join(n for _, n in baseline_models)})"
             )
-        config_src = "checkpoint config.yaml" if base_config is None else args.config
-        print(f"  Config src:  {config_src}")
         print(f"  Dev data:    {eval_data}")
         print(
             f"  Dev samples: "
@@ -1411,11 +1318,6 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
-
-    # ── Shared data params ──
-    max_ctx = ref_config.data.max_context_length
-    max_prompt = ref_config.data.max_prompt_length
-    max_resp = ref_config.data.max_response_length
 
     # ── Evaluate each model ──
     all_results: List[ModelResult] = []
@@ -1443,6 +1345,9 @@ def main():
                 p.requires_grad = False
             qwen = accelerator.prepare(qwen)
 
+            max_ctx = ref_config.data.max_context_length
+            max_prompt = ref_config.data.max_prompt_length
+            max_resp = ref_config.data.max_response_length
             collator = EvalQACollator(
                 pad_token_id=tokenizer.pad_token_id,
                 max_context_length=max_ctx,
@@ -1463,8 +1368,7 @@ def main():
             if is_main:
                 print(f"  Loading dev data...")
             dev_ds = EvalQADataset(
-                eval_data,
-                tokenizer,
+                eval_data, tokenizer,
                 max_context_length=max_ctx,
                 max_prompt_length=max_prompt,
                 max_response_length=max_resp,
@@ -1473,24 +1377,15 @@ def main():
                 dev_ds = Subset(dev_ds, list(range(args.max_eval_samples)))
 
             dev_loader = DataLoader(
-                dev_ds,
-                batch_size=args.batch_size,
-                shuffle=False,
-                collate_fn=collator,
-                num_workers=nw,
-                pin_memory=pin,
+                dev_ds, batch_size=args.batch_size, shuffle=False,
+                collate_fn=collator, num_workers=nw, pin_memory=pin,
             )
             dev_loader = accelerator.prepare(dev_loader)
 
             dev_m, dev_s = evaluate_baseline_qa(
-                qwen,
-                dev_loader,
-                tokenizer,
-                accelerator,
-                max_new_tokens=args.max_new_tokens,
-                source_label="dev",
+                qwen, dev_loader, tokenizer, accelerator,
+                max_new_tokens=args.max_new_tokens, source_label="dev",
             )
-
             mr.dev_loss = dev_m["loss"]
             mr.dev_ppl = dev_m["perplexity"]
             mr.dev_em = dev_m["exact_match"]
@@ -1510,36 +1405,24 @@ def main():
             # Train peek
             if args.train_peek_samples > 0 and os.path.exists(train_data):
                 train_ds = EvalQADataset(
-                    train_data,
-                    tokenizer,
+                    train_data, tokenizer,
                     max_context_length=max_ctx,
                     max_prompt_length=max_prompt,
                     max_response_length=max_resp,
                 )
                 if args.train_peek_samples < len(train_ds):
-                    train_ds = Subset(
-                        train_ds, list(range(args.train_peek_samples))
-                    )
+                    train_ds = Subset(train_ds, list(range(args.train_peek_samples)))
 
                 train_loader = DataLoader(
-                    train_ds,
-                    batch_size=args.batch_size,
-                    shuffle=False,
-                    collate_fn=collator,
-                    num_workers=nw,
-                    pin_memory=pin,
+                    train_ds, batch_size=args.batch_size, shuffle=False,
+                    collate_fn=collator, num_workers=nw, pin_memory=pin,
                 )
                 train_loader = accelerator.prepare(train_loader)
 
                 tr_m, tr_s = evaluate_baseline_qa(
-                    qwen,
-                    train_loader,
-                    tokenizer,
-                    accelerator,
-                    max_new_tokens=args.max_new_tokens,
-                    source_label="train",
+                    qwen, train_loader, tokenizer, accelerator,
+                    max_new_tokens=args.max_new_tokens, source_label="train",
                 )
-
                 mr.train_loss = tr_m["loss"]
                 mr.train_ppl = tr_m["perplexity"]
                 mr.train_em = tr_m["exact_match"]
@@ -1563,26 +1446,24 @@ def main():
                 torch.cuda.empty_cache()
 
     # ── Compressed models (Task Compressor) ──
-    for ckpt_dir, n_p, n_c, k in entries:
-        config_info = f"n_p={n_p}, n_c={n_c}, k={k}"
-        # Derive a readable name from the path
-        # e.g., outputs/ablation_compression/k512_np128_nc384/best -> k512_np128_nc384
-        name_parts = []
-        for part in ckpt_dir.parts:
-            if re.match(r"k\d+", part):
-                name_parts.append(part)
-        exp_name = "/".join(name_parts) if name_parts else ckpt_dir.parent.name
+    for ckpt_dir, config_path, k_value in entries:
+        config = Config.from_yaml(str(config_path))
+        n_p = config.model.n_prompt_tokens
+        n_c = config.model.n_context_tokens
+        config_info = f"n_p={n_p}, n_c={n_c}, k={k_value}"
 
         if is_main:
             print(f"{'=' * W}")
-            print(f"  {BOLD}k={k}{RESET}  ({config_info})  [{ckpt_dir}]")
+            print(f"  {BOLD}k={k_value}{RESET}  ({config_info})  [{ckpt_dir}]")
+            print(f"  Config: {config_path}")
             print(f"  Loading model...")
 
-        fallback_config = base_config if base_config is not None else ref_config
-        model = load_model(
-            ckpt_dir, fallback_config, n_p, n_c, accelerator
-        )
+        model = load_model(ckpt_dir, config, accelerator)
 
+        max_ctx = config.data.max_context_length
+        max_prompt = config.data.max_prompt_length
+        max_resp = config.data.max_response_length
+        max_ans = args.max_new_tokens
         collator = EvalQACollator(
             pad_token_id=tokenizer.pad_token_id,
             max_context_length=max_ctx,
@@ -1593,8 +1474,8 @@ def main():
         pin = accelerator.device.type == "cuda"
 
         mr = ModelResult(
-            name=exp_name,
-            k_value=k,
+            name=f"k={k_value}",
+            k_value=k_value,
             config_info=config_info,
             checkpoint_path=str(ckpt_dir),
         )
@@ -1603,8 +1484,7 @@ def main():
         if is_main:
             print(f"  Loading dev data...")
         dev_ds = EvalQADataset(
-            eval_data,
-            tokenizer,
+            eval_data, tokenizer,
             max_context_length=max_ctx,
             max_prompt_length=max_prompt,
             max_response_length=max_resp,
@@ -1613,24 +1493,15 @@ def main():
             dev_ds = Subset(dev_ds, list(range(args.max_eval_samples)))
 
         dev_loader = DataLoader(
-            dev_ds,
-            batch_size=args.batch_size,
-            shuffle=False,
-            collate_fn=collator,
-            num_workers=nw,
-            pin_memory=pin,
+            dev_ds, batch_size=args.batch_size, shuffle=False,
+            collate_fn=collator, num_workers=nw, pin_memory=pin,
         )
         dev_loader = accelerator.prepare(dev_loader)
 
         dev_m, dev_s = evaluate_qa_detailed(
-            model,
-            dev_loader,
-            tokenizer,
-            accelerator,
-            max_new_tokens=args.max_new_tokens,
-            source_label="dev",
+            model, dev_loader, tokenizer, accelerator,
+            max_new_tokens=max_ans, source_label="dev",
         )
-
         mr.dev_loss = dev_m["loss"]
         mr.dev_ppl = dev_m["perplexity"]
         mr.dev_em = dev_m["exact_match"]
@@ -1650,36 +1521,24 @@ def main():
         # Train peek
         if args.train_peek_samples > 0 and os.path.exists(train_data):
             train_ds = EvalQADataset(
-                train_data,
-                tokenizer,
+                train_data, tokenizer,
                 max_context_length=max_ctx,
                 max_prompt_length=max_prompt,
                 max_response_length=max_resp,
             )
             if args.train_peek_samples < len(train_ds):
-                train_ds = Subset(
-                    train_ds, list(range(args.train_peek_samples))
-                )
+                train_ds = Subset(train_ds, list(range(args.train_peek_samples)))
 
             train_loader = DataLoader(
-                train_ds,
-                batch_size=args.batch_size,
-                shuffle=False,
-                collate_fn=collator,
-                num_workers=nw,
-                pin_memory=pin,
+                train_ds, batch_size=args.batch_size, shuffle=False,
+                collate_fn=collator, num_workers=nw, pin_memory=pin,
             )
             train_loader = accelerator.prepare(train_loader)
 
             tr_m, tr_s = evaluate_qa_detailed(
-                model,
-                train_loader,
-                tokenizer,
-                accelerator,
-                max_new_tokens=args.max_new_tokens,
-                source_label="train",
+                model, train_loader, tokenizer, accelerator,
+                max_new_tokens=max_ans, source_label="train",
             )
-
             mr.train_loss = tr_m["loss"]
             mr.train_ppl = tr_m["perplexity"]
             mr.train_em = tr_m["exact_match"]
