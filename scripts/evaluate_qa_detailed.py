@@ -495,14 +495,14 @@ def evaluate_qa_detailed(
                 batch["prompt_ids"],
                 batch["prompt_mask"],
             )
-        gen_ids = unwrapped.generate(
-            compressed,
-            batch["prompt_ids"],
-            batch["prompt_mask"],
-            max_new_tokens=max_new_tokens,
-            temperature=0.0,  # greedy for deterministic eval
-            eos_token_id=tokenizer.eos_token_id,
-        )
+            gen_ids = unwrapped.generate(
+                compressed,
+                batch["prompt_ids"],
+                batch["prompt_mask"],
+                max_new_tokens=max_new_tokens,
+                temperature=0.0,  # greedy for deterministic eval
+                eos_token_id=tokenizer.eos_token_id,
+            )
         preds = tokenizer.batch_decode(gen_ids, skip_special_tokens=True)
 
         for i, (pred, gold) in enumerate(zip(preds, answer_texts)):
