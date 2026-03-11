@@ -110,10 +110,18 @@ def main():
 
     # ── Logging ──────────────────────────────────────────────────────────
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    logging.basicConfig(
-        level=logging.INFO if local_rank == 0 else logging.WARNING,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-    )
+    log_level = logging.INFO if local_rank == 0 else logging.WARNING
+    log_format = "%(asctime)s [%(levelname)s] %(message)s"
+    logging.basicConfig(level=log_level, format=log_format)
+
+    # Also log to file (only on main process)
+    if local_rank == 0:
+        log_dir = Path(config.output_dir)
+        log_dir.mkdir(parents=True, exist_ok=True)
+        file_handler = logging.FileHandler(log_dir / "train.log", mode="a")
+        file_handler.setLevel(logging.INFO)
+        file_handler.setFormatter(logging.Formatter(log_format))
+        logging.getLogger().addHandler(file_handler)
 
     if local_rank == 0:
         logger.info(f"Config: {config.to_dict()}")
