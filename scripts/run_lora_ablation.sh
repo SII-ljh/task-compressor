@@ -17,7 +17,7 @@
 #   r128_qkvo   — rank=128, target=q,k,v,o
 #   r128_all    — rank=128, target=all linear
 #
-# Training: total_steps=50000 with early stopping (patience=10).
+# Training: total_steps=5000 with early stopping (patience=10).
 #
 # Usage:
 #   bash scripts/run_lora_ablation.sh              # run all
@@ -113,7 +113,7 @@ cfg['data']['max_prompt_length'] = 512
 # ── Training: large steps + early stopping ──
 cfg['training']['per_gpu_batch_size'] = ${BS}
 cfg['training']['gradient_accumulation_steps'] = ${GA}
-cfg['training']['total_steps'] = 50000
+cfg['training']['total_steps'] = 5000
 cfg['training']['warmup_steps'] = 500
 cfg['training']['eval_steps'] = 500
 cfg['training']['save_steps'] = 2000
