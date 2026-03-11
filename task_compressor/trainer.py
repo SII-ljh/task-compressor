@@ -48,6 +48,7 @@ class Trainer:
 
         # Best eval loss for early-stopping / best checkpoint
         self.best_eval_loss = float("inf")
+        self._patience_counter = 0
 
         # Distributed setup
         self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -126,12 +127,19 @@ class Trainer:
             self.optimizer, [warmup, cosine], milestones=[tc.warmup_steps]
         )
 
+    def _should_early_stop(self) -> bool:
+        patience = self.config.training.early_stopping_patience
+        if patience <= 0:
+            return False
+        return self._patience_counter >= patience
+
     def train(self):
         tc = self.config.training
         self.model.train()
         self.optimizer.zero_grad()
 
         epoch = 0
+        early_stopped = False
         while self.global_step < tc.total_steps:
             if isinstance(self.train_loader.sampler, DistributedSampler):
                 self.train_loader.sampler.set_epoch(epoch)
@@ -170,12 +178,23 @@ class Trainer:
                     and self.global_step % tc.eval_steps == 0
                 ):
                     self._evaluate()
+                    if self._should_early_stop():
+                        early_stopped = True
+                        break
                     self.model.train()
 
                 # Save checkpoint
                 if self.is_main and self.global_step % tc.save_steps == 0:
                     self._save_checkpoint()
 
+            if early_stopped:
+                if self.is_main:
+                    logger.info(
+                        f"Early stopping at step {self.global_step} "
+                        f"(no improvement for {self._patience_counter} evals, "
+                        f"best_eval_loss={self.best_eval_loss:.4f})"
+                    )
+                break
             epoch += 1
 
         # Final save
@@ -268,16 +287,26 @@ class Trainer:
         improved = ""
         if avg_loss < self.best_eval_loss:
             self.best_eval_loss = avg_loss
+            self._patience_counter = 0
             improved = "  ** best **"
             if self.is_main:
                 self._save_checkpoint(tag="best")
+        else:
+            self._patience_counter += 1
+
+        patience = self.config.training.early_stopping_patience
+        patience_info = (
+            f"  patience={self._patience_counter}/{patience}"
+            if patience > 0
+            else ""
+        )
 
         if self.is_main:
             logger.info(
                 f"[Eval] step {self.global_step}/{tc.total_steps}  "
                 f"eval_loss={avg_loss:.4f}  eval_ppl={ppl:.2f}  "
                 f"best={self.best_eval_loss:.4f}  "
-                f"samples={n_samples}{improved}"
+                f"samples={n_samples}{improved}{patience_info}"
             )
             metrics = {
                 "eval/loss": avg_loss,
@@ -457,8 +486,9 @@ class Trainer:
         name = tag or f"step_{self.global_step}"
         ckpt_dir = out_dir / name
 
-        # Save LoRA adapter
-        self.raw_model.base_model.save_pretrained(str(ckpt_dir / "lora_adapter"))
+        # Save LoRA adapter (if applicable)
+        if getattr(self.raw_model, '_has_lora', True):
+            self.raw_model.base_model.save_pretrained(str(ckpt_dir / "lora_adapter"))
 
         # Save perceiver, prompt encoder, and other new parameters
         new_state = {}

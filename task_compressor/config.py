@@ -47,6 +47,7 @@ class TrainingConfig:
     max_eval_samples: int = 5000
     num_sample_predictions: int = 3
     resume_from: Optional[str] = None  # checkpoint path to resume training
+    early_stopping_patience: int = 0  # 0 = disabled; stop after N evals without improvement
 
 
 @dataclass

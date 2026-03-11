@@ -79,21 +79,22 @@ def load_checkpoint(model: TaskCompressorModel, ckpt_dir: str) -> None:
     else:
         logger.warning(f"No task_compressor_modules.pt found in {ckpt_path}")
 
-    # Load LoRA adapter weights
-    lora_path = ckpt_path / "lora_adapter"
-    if lora_path.exists():
-        from peft import set_peft_model_state_dict
-        lora_state = torch.load(
-            lora_path / "adapter_model.safetensors"
-            if (lora_path / "adapter_model.safetensors").exists()
-            else lora_path / "adapter_model.bin",
-            map_location="cpu",
-            weights_only=True,
-        )
-        set_peft_model_state_dict(model.base_model, lora_state)
-        logger.info(f"Loaded LoRA adapter from {lora_path}")
-    else:
-        logger.warning(f"No lora_adapter directory found in {ckpt_path}")
+    # Load LoRA adapter weights (skip if model has no LoRA)
+    if getattr(model, '_has_lora', True):
+        lora_path = ckpt_path / "lora_adapter"
+        if lora_path.exists():
+            from peft import set_peft_model_state_dict
+            lora_state = torch.load(
+                lora_path / "adapter_model.safetensors"
+                if (lora_path / "adapter_model.safetensors").exists()
+                else lora_path / "adapter_model.bin",
+                map_location="cpu",
+                weights_only=True,
+            )
+            set_peft_model_state_dict(model.base_model, lora_state)
+            logger.info(f"Loaded LoRA adapter from {lora_path}")
+        else:
+            logger.warning(f"No lora_adapter directory found in {ckpt_path}")
 
 
 def main():

@@ -33,6 +33,7 @@ training:
   max_eval_samples: 5000      # cap eval to N samples (0 = all)
   num_sample_predictions: 3   # generate N sample predictions during eval
   resume_from: null           # checkpoint path to resume training
+  early_stopping_patience: 0  # 0 = disabled; stop after N evals w/o improvement
 
 data:
   max_context_length: 4096

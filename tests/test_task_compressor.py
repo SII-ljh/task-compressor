@@ -59,6 +59,7 @@ def _build_tiny_model() -> TaskCompressorModel:
         p.requires_grad = False
 
     # Add LoRA
+    model._has_lora = True
     lora_config = LoraConfig(
         r=config.lora_rank,
         lora_alpha=config.lora_alpha,

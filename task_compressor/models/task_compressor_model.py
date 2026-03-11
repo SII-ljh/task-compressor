@@ -41,16 +41,18 @@ class TaskCompressorModel(nn.Module):
         for p in self.base_model.parameters():
             p.requires_grad = False
 
-        # ── 2. Add LoRA adapters ─────────────────────────────────────────
-        lora_config = LoraConfig(
-            r=config.lora_rank,
-            lora_alpha=config.lora_alpha,
-            target_modules=config.lora_target_modules,
-            lora_dropout=config.lora_dropout,
-            bias="none",
-            task_type="CAUSAL_LM",
-        )
-        self.base_model = get_peft_model(self.base_model, lora_config)
+        # ── 2. Add LoRA adapters (skip if rank=0 → frozen encoder) ──────
+        self._has_lora = config.lora_rank > 0
+        if self._has_lora:
+            lora_config = LoraConfig(
+                r=config.lora_rank,
+                lora_alpha=config.lora_alpha,
+                target_modules=config.lora_target_modules,
+                lora_dropout=config.lora_dropout,
+                bias="none",
+                task_type="CAUSAL_LM",
+            )
+            self.base_model = get_peft_model(self.base_model, lora_config)
 
         # ── Read model dimensions from config ────────────────────────────
         model_cfg = self.base_model.config
@@ -123,6 +125,12 @@ class TaskCompressorModel(nn.Module):
 
     # ── Helpers ──────────────────────────────────────────────────────────
 
+    def _get_inner_model(self):
+        """Get the underlying CausalLM, unwrapping PEFT wrapper if present."""
+        if self._has_lora:
+            return self.base_model.get_base_model()
+        return self.base_model
+
     def get_embedding_layer(self) -> nn.Embedding:
         return self.base_model.get_input_embeddings()
 
@@ -141,18 +149,19 @@ class TaskCompressorModel(nn.Module):
         context_ids: torch.Tensor,
         context_mask: torch.Tensor,
     ) -> torch.Tensor:
-        """Encode context through LoRA-augmented Qwen.
+        """Encode context through Qwen (LoRA-augmented if rank > 0, frozen if rank = 0).
 
         Returns:
             (B, L_c, D) last hidden states.
         """
-        self.base_model.enable_adapter_layers()
+        if self._has_lora:
+            self.base_model.enable_adapter_layers()
         # Call the inner transformer (QwenModel) directly to get
         # last_hidden_state.  Going through the CausalLM wrapper requires
         # output_hidden_states=True which forces ALL intermediate layer
         # outputs to persist in memory — defeating gradient checkpointing
         # and wasting ~7 GB for a 0.6B model (B=32, L=4096).
-        causal_lm = self.base_model.get_base_model()
+        causal_lm = self._get_inner_model()
         outputs = causal_lm.model(
             input_ids=context_ids,
             attention_mask=context_mask,
@@ -243,13 +252,16 @@ class TaskCompressorModel(nn.Module):
         then apply lm_head **only** to response-relevant positions, avoiding
         the full (B, total_len, V) logit tensor.
 
-        Gradient checkpointing is temporarily disabled during decode because
-        the LoRA adapter toggle changes the computation graph.  Checkpointing
-        recomputation would see the wrong adapter state, producing shape
-        mismatches.
+        When LoRA is active, gradient checkpointing is temporarily disabled
+        during decode because the adapter toggle changes the computation
+        graph.  When LoRA is off (rank=0), no toggle occurs so checkpointing
+        stays on.
         """
-        gc_was_on = self._pause_gradient_checkpointing()
-        self._disable_adapter_forward_only()
+        gc_was_on = False
+        if self._has_lora:
+            gc_was_on = self._pause_gradient_checkpointing()
+            self._disable_adapter_forward_only()
+
         B = compressed.shape[0]
         device = compressed.device
         k = compressed.shape[1]
@@ -277,7 +289,7 @@ class TaskCompressorModel(nn.Module):
         # Use inner transformer to get hidden states, then apply lm_head
         # only to response-relevant positions.  This avoids materializing
         # the full (B, total_len, V) logit tensor — saving ~50% decode VRAM.
-        causal_lm = self.base_model.get_base_model()
+        causal_lm = self._get_inner_model()
         outputs = causal_lm.model(
             inputs_embeds=inputs_embeds,
             attention_mask=attn_mask,
@@ -296,8 +308,9 @@ class TaskCompressorModel(nn.Module):
         labels[response_mask == 0] = -100
 
         # Re-enable adapter forward so subsequent calls (e.g. encode) work
-        self._enable_adapter_forward_only()
-        self._resume_gradient_checkpointing(gc_was_on)
+        if self._has_lora:
+            self._enable_adapter_forward_only()
+            self._resume_gradient_checkpointing(gc_was_on)
 
         return {
             "logits": logits,   # (B, L_t, V) — response positions only
@@ -367,8 +380,11 @@ class TaskCompressorModel(nn.Module):
         Returns:
             (B, max_generated) generated token ids
         """
-        gc_was_on = self._pause_gradient_checkpointing()
-        self._disable_adapter_forward_only()
+        gc_was_on = False
+        if self._has_lora:
+            gc_was_on = self._pause_gradient_checkpointing()
+            self._disable_adapter_forward_only()
+
         B = compressed.shape[0]
         device = compressed.device
         k = compressed.shape[1]
@@ -430,6 +446,7 @@ class TaskCompressorModel(nn.Module):
                 dim=1,
             )
 
-        self._enable_adapter_forward_only()
-        self._resume_gradient_checkpointing(gc_was_on)
+        if self._has_lora:
+            self._enable_adapter_forward_only()
+            self._resume_gradient_checkpointing(gc_was_on)
         return torch.cat(generated_ids, dim=-1)  # (B, num_generated)

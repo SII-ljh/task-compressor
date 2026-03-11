@@ -1,0 +1,396 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Task Compressor — Architecture</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --card: #1a1d27;
+    --border: #2a2d3a;
+    --accent: #6c8aff;
+    --accent2: #ff6c8a;
+    --accent3: #6cffa0;
+    --accent4: #ffc86c;
+    --text: #e0e0e8;
+    --muted: #8888a0;
+    --radius: 10px;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: "Inter", "SF Pro Display", -apple-system, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.7;
+    padding: 40px 20px;
+  }
+  .container { max-width: 960px; margin: 0 auto; }
+
+  h1 {
+    font-size: 2.2rem;
+    font-weight: 700;
+    text-align: center;
+    margin-bottom: 8px;
+    background: linear-gradient(135deg, var(--accent), var(--accent2));
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }
+  .subtitle {
+    text-align: center;
+    color: var(--muted);
+    font-size: 1rem;
+    margin-bottom: 48px;
+  }
+
+  h2 {
+    font-size: 1.3rem;
+    font-weight: 600;
+    margin-bottom: 12px;
+    color: var(--accent);
+  }
+
+  /* ── Pipeline Diagram ─────────────────────────── */
+  .pipeline {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0;
+    margin-bottom: 48px;
+    flex-wrap: wrap;
+  }
+  .stage {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 18px 22px;
+    text-align: center;
+    min-width: 140px;
+    position: relative;
+  }
+  .stage .label {
+    font-weight: 600;
+    font-size: 0.95rem;
+    margin-bottom: 4px;
+  }
+  .stage .desc {
+    font-size: 0.78rem;
+    color: var(--muted);
+  }
+  .stage.encoder { border-color: var(--accent); }
+  .stage.encoder .label { color: var(--accent); }
+  .stage.prompt-enc { border-color: var(--accent4); }
+  .stage.prompt-enc .label { color: var(--accent4); }
+  .stage.perceiver { border-color: var(--accent2); }
+  .stage.perceiver .label { color: var(--accent2); }
+  .stage.decoder { border-color: var(--accent3); }
+  .stage.decoder .label { color: var(--accent3); }
+
+  .arrow {
+    font-size: 1.4rem;
+    color: var(--muted);
+    padding: 0 8px;
+    flex-shrink: 0;
+  }
+
+  /* ── Detail Cards ─────────────────────────────── */
+  .grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 20px;
+    margin-bottom: 40px;
+  }
+  @media (max-width: 640px) { .grid { grid-template-columns: 1fr; } }
+
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 24px;
+  }
+  .card p { font-size: 0.88rem; color: var(--muted); margin-bottom: 8px; }
+  .card ul { padding-left: 18px; font-size: 0.85rem; color: var(--muted); }
+  .card li { margin-bottom: 4px; }
+  .card code {
+    background: rgba(108,138,255,0.12);
+    padding: 1px 6px;
+    border-radius: 4px;
+    font-size: 0.82rem;
+    color: var(--accent);
+  }
+
+  /* ── Shared Weight Badge ──────────────────────── */
+  .shared-badge {
+    display: inline-block;
+    background: linear-gradient(135deg, var(--accent), var(--accent3));
+    color: var(--bg);
+    font-size: 0.72rem;
+    font-weight: 700;
+    padding: 2px 8px;
+    border-radius: 20px;
+    margin-left: 6px;
+    vertical-align: middle;
+  }
+
+  /* ── Architecture SVG Diagram ─────────────────── */
+  .diagram-wrapper {
+    margin-bottom: 48px;
+    overflow-x: auto;
+  }
+  .diagram-wrapper svg {
+    display: block;
+    margin: 0 auto;
+  }
+
+  /* ── Data Flow ─────────────────────────────────── */
+  .flow-section {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 28px;
+    margin-bottom: 40px;
+  }
+  .flow-section h2 { margin-bottom: 16px; }
+  .flow-step {
+    display: flex;
+    align-items: flex-start;
+    gap: 14px;
+    margin-bottom: 14px;
+  }
+  .flow-step:last-child { margin-bottom: 0; }
+  .step-num {
+    flex-shrink: 0;
+    width: 28px;
+    height: 28px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-weight: 700;
+    font-size: 0.8rem;
+    color: var(--bg);
+  }
+  .step-num.s1 { background: var(--accent); }
+  .step-num.s2 { background: var(--accent4); }
+  .step-num.s3 { background: var(--accent2); }
+  .step-num.s4 { background: var(--accent3); }
+  .step-text { font-size: 0.9rem; padding-top: 3px; }
+  .step-text strong { color: var(--text); }
+  .step-text span { color: var(--muted); }
+
+  /* ── Params Table ──────────────────────────────── */
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.85rem;
+    margin-top: 12px;
+  }
+  th, td {
+    text-align: left;
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--border);
+  }
+  th { color: var(--accent); font-weight: 600; font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.04em; }
+  td { color: var(--muted); }
+  tr:last-child td { border-bottom: none; }
+
+  /* ── Footer ────────────────────────────────────── */
+  .footer {
+    text-align: center;
+    color: var(--muted);
+    font-size: 0.78rem;
+    margin-top: 40px;
+    padding-top: 20px;
+    border-top: 1px solid var(--border);
+  }
+
+  /* ── Perceiver Block Detail ────────────────────── */
+  .perceiver-block {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-top: 12px;
+  }
+  .pblock {
+    background: rgba(255,108,138,0.08);
+    border-left: 3px solid var(--accent2);
+    padding: 8px 14px;
+    border-radius: 0 6px 6px 0;
+    font-size: 0.82rem;
+    color: var(--muted);
+  }
+  .pblock strong { color: var(--accent2); }
+</style>
+</head>
+<body>
+<div class="container">
+
+  <h1>Task Compressor</h1>
+  <p class="subtitle">Compressing ultra-long context into fixed-length soft prompts for efficient QA</p>
+
+  <!-- ── Pipeline Overview ──────────────────────────── -->
+  <div class="pipeline">
+    <div class="stage encoder">
+      <div class="label">LoRA Encoder</div>
+      <div class="desc">Qwen + LoRA</div>
+    </div>
+    <div class="arrow">&#8594;</div>
+    <div class="stage prompt-enc">
+      <div class="label">Prompt Encoder</div>
+      <div class="desc">Cross-Attn Latents</div>
+    </div>
+    <div class="arrow">&#8594;</div>
+    <div class="stage perceiver">
+      <div class="label">Perceiver</div>
+      <div class="desc">Compress to k tokens</div>
+    </div>
+    <div class="arrow">&#8594;</div>
+    <div class="stage decoder">
+      <div class="label">Frozen Decoder</div>
+      <div class="desc">Qwen (LoRA off)</div>
+    </div>
+  </div>
+
+  <!-- ── Data Flow Steps ────────────────────────────── -->
+  <div class="flow-section">
+    <h2>Forward Pass</h2>
+
+    <div class="flow-step">
+      <div class="step-num s1">1</div>
+      <div class="step-text">
+        <strong>Encode</strong> &mdash;
+        <span>长文本 context 通过 Qwen + LoRA 编码，得到 hidden states <code>(B, L<sub>c</sub>, D)</code></span>
+      </div>
+    </div>
+
+    <div class="flow-step">
+      <div class="step-num s2">2</div>
+      <div class="step-text">
+        <strong>Prompt Encode</strong> &mdash;
+        <span>n<sub>p</sub>=16 个可学习 latent tokens 对 frozen prompt embeddings 做 cross-attention，得到 prompt latents <code>(B, n<sub>p</sub>, D)</code></span>
+      </div>
+    </div>
+
+    <div class="flow-step">
+      <div class="step-num s3">3</div>
+      <div class="step-text">
+        <strong>Compress</strong> &mdash;
+        <span>将 prompt latents 与 n<sub>c</sub>=48 个 context tokens 拼接为 query <code>(B, k, D)</code>，经过 Perceiver 压缩 encoder hidden states → k=64 个 soft prompts</span>
+      </div>
+    </div>
+
+    <div class="flow-step">
+      <div class="step-num s4">4</div>
+      <div class="step-text">
+        <strong>Decode</strong> &mdash;
+        <span>Frozen Qwen（LoRA 关闭）接收 <code>[soft prompts | sep | prompt | response]</code>，teacher-forcing 生成</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Component Details ──────────────────────────── -->
+  <div class="grid">
+    <div class="card">
+      <h2 style="color:var(--accent)">LoRA Encoder <span class="shared-badge">Shared Qwen</span></h2>
+      <p>在 Qwen 基础模型上添加 LoRA adapter，仅训练 ~1% 参数，编码长文本 context。</p>
+      <ul>
+        <li>Target modules: <code>q_proj</code>, <code>v_proj</code></li>
+        <li>LoRA rank: <code>128</code>, alpha: <code>256</code></li>
+        <li>Dropout: <code>0.05</code></li>
+      </ul>
+    </div>
+
+    <div class="card">
+      <h2 style="color:var(--accent4)">Prompt Encoder</h2>
+      <p>将变长 user prompt 压缩为固定数量的 latent vectors，提供 task-aware 的 query 信号。</p>
+      <ul>
+        <li><code>n_p=16</code> 个 learnable latent tokens</li>
+        <li>Single cross-attention layer (Pre-LN + residual)</li>
+        <li>KV = frozen Qwen embedding(prompt)</li>
+      </ul>
+    </div>
+
+    <div class="card">
+      <h2 style="color:var(--accent2)">Query-Conditioned Perceiver</h2>
+      <p>核心压缩模块。Query 由 prompt latents + context tokens 组成，从 encoder hidden states 中提取信息。</p>
+      <div class="perceiver-block">
+        <div class="pblock"><strong>Cross-Attention</strong> &mdash; query attends to encoder hidden states</div>
+        <div class="pblock"><strong>Self-Attention</strong> &mdash; query tokens 之间交互</div>
+        <div class="pblock"><strong>FFN</strong> &mdash; GELU activation, Pre-LN + residual</div>
+      </div>
+      <p style="margin-top:10px"><code>num_layers=2</code>，输出 final LayerNorm + scale matching</p>
+    </div>
+
+    <div class="card">
+      <h2 style="color:var(--accent3)">Frozen Decoder <span class="shared-badge">Shared Qwen</span></h2>
+      <p>与 Encoder 共享同一个 Qwen 实例，通过 toggle LoRA on/off 切换角色。Decoder 阶段 LoRA 关闭。</p>
+      <ul>
+        <li>输入: <code>[compressed | sep | prompt | response]</code></li>
+        <li>只对 response positions 计算 logits（节省 VRAM）</li>
+        <li>CE loss on response tokens (fp32)</li>
+      </ul>
+    </div>
+  </div>
+
+  <!-- ── Parameter Table ────────────────────────────── -->
+  <div class="card">
+    <h2>Trainable Parameters</h2>
+    <table>
+      <thead>
+        <tr><th>Component</th><th>Description</th><th>Params</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>LoRA Adapter</td><td>q_proj, v_proj (rank=128)</td><td>~1% of base</td></tr>
+        <tr><td>Prompt Encoder</td><td>16 latents + cross-attn layer</td><td>~2M</td></tr>
+        <tr><td>Context Tokens</td><td>48 learnable query tokens</td><td>48 &times; D</td></tr>
+        <tr><td>Perceiver</td><td>2 layers &times; (cross + self + FFN)</td><td>~50M</td></tr>
+        <tr><td>Separator</td><td>1 learnable token</td><td>D</td></tr>
+        <tr><td>Base Qwen</td><td>Frozen (shared encoder/decoder)</td><td>0 (frozen)</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- ── Key Design ──────────────────────────────────── -->
+  <div class="flow-section" style="margin-top: 40px;">
+    <h2>Key Design Decisions</h2>
+
+    <div class="flow-step">
+      <div class="step-num s1">1</div>
+      <div class="step-text">
+        <strong>单 Qwen 实例</strong> &mdash;
+        <span>Encoder 和 Decoder 共享权重，通过 PEFT 的 LoRA enable/disable 切换。节省显存，避免加载两份模型。</span>
+      </div>
+    </div>
+
+    <div class="flow-step">
+      <div class="step-num s2">2</div>
+      <div class="step-text">
+        <strong>单阶段训练</strong> &mdash;
+        <span>LoRA 初始化 delta &asymp; 0，Perceiver 从一开始就能获得高质量的 Qwen hidden states，无需预训练。</span>
+      </div>
+    </div>
+
+    <div class="flow-step">
+      <div class="step-num s3">3</div>
+      <div class="step-text">
+        <strong>差异化学习率</strong> &mdash;
+        <span>Perceiver / Prompt Encoder 使用 5e-5，LoRA 使用 1e-5，平衡模块间的训练速度。</span>
+      </div>
+    </div>
+
+    <div class="flow-step">
+      <div class="step-num s4">4</div>
+      <div class="step-text">
+        <strong>Scale Matching</strong> &mdash;
+        <span>Perceiver 输出通过 LayerNorm gamma 初始化为 embedding std，避免 decoder 输入 scale 不匹配导致 NaN。</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="footer">
+    Task Compressor &mdash; Qwen-based context compression for efficient long-document QA
+  </div>
+
+</div>
+</body>
+</html>
