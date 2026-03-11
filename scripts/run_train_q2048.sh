@@ -43,8 +43,8 @@ cfg['model']['lora_target_modules'] = ['q_proj', 'v_proj']
 cfg['data']['max_prompt_length'] = 2048
 
 # ── Training ──
-cfg['training']['per_gpu_batch_size'] = 32
-cfg['training']['gradient_accumulation_steps'] = 1
+cfg['training']['per_gpu_batch_size'] = 8
+cfg['training']['gradient_accumulation_steps'] = 4
 cfg['training']['total_steps'] = 50000
 cfg['training']['warmup_steps'] = 500
 cfg['training']['eval_steps'] = 500
